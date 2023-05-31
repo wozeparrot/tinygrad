@@ -1,5 +1,6 @@
 from tinygrad.tensor import Tensor
 from tinygrad import nn
+from tinygrad.helpers import IMAGE
 from extra.utils import get_child, download_file
 import numpy as np
 
@@ -10,22 +11,30 @@ from math import prod
 from models.resnet import ResNet
 from models.retinanet import ResNetFPN
 
+assert IMAGE
 
 class MaskRCNN:
   def __init__(self, backbone: ResNet):
+    self.transform = RcnnTransform(min_size=800, max_size=1333, image_mean=[0.485, 0.456, 0.406], image_std=[0.229, 0.224, 0.225])
     self.backbone = ResNetFPN(backbone, out_channels=256, returned_layers=[1, 2, 3, 4])
     self.rpn = RPN(self.backbone.out_channels)
     self.roi_heads = RoIHeads(self.backbone.out_channels, 91)
 
   def __call__(self, x):
-    features = self.backbone(x)
+    transformed_img = self.transform(x)
+    features = self.backbone(transformed_img)
     proposals = self.rpn(features)
     detections = self.roi_heads(features, proposals)
     return detections
 
   def load_from_pretrained(self):
     fn = Path(__file__).parent.parent / "weights/maskrcnn.pt"
-    download_file("https://download.pytorch.org/models/maskrcnn/e2e_mask_rcnn_R_50_FPN_1x.pth", fn)
+    
+    model_urls = {0: "https://download.pytorch.org/models/maskrcnn_resnet50_fpn_coco-bf2d0c1e.pth", # faithful the the original paper https://arxiv.org/abs/1703.06870
+                  1: "https://download.pytorch.org/models/maskrcnn_resnet50_fpn_v2_coco-73cbd019.pth", # improvement based on Detection Transfer Learning with ViT https://arxiv.org/abs/2111.11429
+                  2: "https://download.pytorch.org/models/maskrcnn/e2e_mask_rcnn_R_50_FPN_1x.pth",
+                  }
+    download_file(model_urls[2], fn)
 
     import torch
     with open(fn, "rb") as f:
@@ -46,6 +55,96 @@ class MaskRCNN:
       get_child(self, k).assign(v.numpy()).realize()
 
 
+# based on https://chao-ji.github.io/jekyll/update/2018/07/19/BilinearResize.html
+# TODO: make it inline
+def bilinear_resize_vectorized(image: Tensor, height, width, grad: Tensor):
+  """
+  `image` is a 2-D array, holding the input image
+  `height` and `width` are the desired spatial dimension of the new 2-D array.
+  `grad` is a 2-D array of shape [height, width], holding the gradient to be
+    backpropped to `image`.
+  """
+  img_height, img_width = image.shape
+
+  image.ravel()
+
+  x_ratio = float(img_width - 1) / (width - 1) if width > 1 else 0
+  y_ratio = float(img_height - 1) / (height - 1) if height > 1 else 0
+
+  y, x = np.divmod(np.arange(height * width), width)
+
+  x_l = np.floor(x_ratio * x).astype('int32')
+  y_l = np.floor(y_ratio * y).astype('int32')
+
+  x_h = np.ceil(x_ratio * x).astype('int32')
+  y_h = np.ceil(y_ratio * y).astype('int32')
+
+  x_weight = (x_ratio * x) - x_l
+  y_weight = (y_ratio * y) - y_l
+
+  grad = grad.ravel()
+
+  # gradient wrt `a`, `b`, `c`, `d`
+  d_a = (1 - x_weight) * (1 - y_weight) * grad
+  d_b = x_weight * (1 - y_weight) * grad
+  d_c = y_weight * (1 - x_weight) * grad
+  d_d = x_weight * y_weight * grad
+
+  # [4 * height * width]
+  grad = np.concatenate([d_a, d_b, d_c, d_d])
+  # [4 * height * width]
+  indices = np.concatenate([y_l * img_width + x_l,
+                            y_l * img_width + x_h,
+                            y_h * img_width + x_l,
+                            y_h * img_width + x_h])
+
+  # we must route gradients in `grad` to the correct indices of `image` in
+  # `indices`, e.g. only entries of indices `y_l * img_width + x_l` in `image`
+  # gets the gradient backpropped from `a`.
+
+  # use numpy's broadcasting rule to generate 2-D array of shape
+  # [4 * height * width, img_height * img_width]
+  indices = (indices.reshape((-1, 1)) ==
+              np.arange(img_height * img_width).reshape((1, -1)))
+  d_image = np.apply_along_axis(lambda col: grad[col].sum(), 0, indices)
+
+  return d_image.reshape((img_height, img_width))
+
+
+# based on https://github.com/pytorch/vision/blob/01b9faa16cfeacbb70aa33bd18534de50891786b/torchvision/models/detection/transform.py
+class RcnnTransform:
+  def __init__(self, min_size: int, max_size: int, image_mean: List[float], image_std: List[float]):
+    self.min_size = min_size
+    self.max_size = max_size
+    self.image_mean = image_mean
+    self.image_std = image_std
+
+  def forward(self, images:List[Tensor]):
+    for i in range(len(images)):
+      # inplace normalize&resize?
+      self.normalize(images[i])
+      images[i] = self.resize(images[i])
+
+    #batching?
+
+  # this happens inplace?
+  def normalize(self, image: Tensor):
+    mean = Tensor(self.image_mean, dtype=image.dtype, device=image.device)
+    std = Tensor(self.image_std, dtype=image.dtype, device=image.device)
+    (image - mean[:, None, None]) / std[:, None, None]
+
+  # make it happen inplace
+  def resize(self, image: Tensor):
+    im_shape = Tensor(image.shape[-2:])
+    im_min_dim = min(im_shape)
+    im_max_dim = max(im_shape)
+    scale_factor = min(self.min_size / im_min_dim, self.max_size / im_max_dim)
+    resized_im_shape = (scale_factor * x for x in im_shape)
+    return bilinear_resize_vectorized(image, *resized_im_shape, grad)
+
+  
+  
+  
 class RPN:
   def __init__(self, in_channels):
     self.anchor_generator = AnchorGenerator()
