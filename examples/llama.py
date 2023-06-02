@@ -208,6 +208,7 @@ if __name__ == "__main__":
   chatbot = args.prompt == None
 
   # load model (you have to find the weights yourself)
+  """
   from extra.utils import fake_torch_load_zipped, get_child
 
   if args.large:
@@ -262,6 +263,16 @@ if __name__ == "__main__":
       get_child(model, k).assign(v).realize()
 
     del weights
+  """
+
+  from tinygrad.state import torch_load, get_state_dict
+  state_dict = torch_load(WEIGHTS_7B_FILENAME)
+  model = Transformer(**args_7B)
+  with Timing("loaded weights in ", lambda et_ns: f", {GlobalCounters.mem_used/1e9:.2f} GB loaded at {GlobalCounters.mem_used/et_ns:.2f} GB/s"):
+    for k,v in (t := tqdm(get_state_dict(model).items())):
+      t.set_description(f"loading {k} ram used: {GlobalCounters.mem_used/1e9:5.2f} GB")
+      if k not in state_dict: continue
+      v.assign(state_dict[k].to('cpu').to(v.device)).realize()
 
   # *** prompt engineers work here ****
 
