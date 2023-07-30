@@ -287,7 +287,7 @@ jobs:
       - name: Check Device.DEFAULT
         run: python -c "from tinygrad.lazy import Device; assert Device.DEFAULT in ['LLVM','CLANG','CUDA','GPU'], Device.DEFAULT"
       - name: Test DTypes
-        run: python -m pytest test/test_dtypes.py
+        run: python -m pytest test/test_dtype.py
       - name: Run pytest (not cuda)
         if: matrix.backend!='cuda'
         run: python -m pytest -n=auto test/ -k '${{matrix.backend=='llvm'&&'not (test_nn.py and test_conv_transpose2d)'||'test'}}' -m 'not exclude_${{matrix.backend}}'
