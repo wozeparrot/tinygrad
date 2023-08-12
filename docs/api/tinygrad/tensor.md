@@ -53,7 +53,7 @@ Sets the underlying buffer of the tensor to the buffer of `x`.
 
 When `self` is a disk tensor, this will instead write the buffer of `x` to the disk tensor.
 
-#### `.default(self) -> Tensor`
+#### `.detach(self) -> Tensor`
 
 Detaches the tensor from the autograd engine, then returns it.
 
@@ -122,7 +122,7 @@ Additionally, all other keyword arguments are passed to the constructor of the t
 #### `Tensor.full_like(tensor, fill_value, dtype:Optional[DType]=None, **kwargs) -> Tensor`
 
 Creates a tensor with the same shape as `tensor`, filled with the given value.
-If `dtype` is not specified, the dtype of `tensor` is used.
+If `dtype` is not specified, the `dtype` of `tensor` is used.
 
 You can pass in the `device` keyword argument to control device of the tensor.
 Additionally, all other keyword arguments are passed to the constructor of the tensor.
@@ -196,6 +196,14 @@ Additionally, all other keyword arguments are passed to the constructor of the t
 You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
 Additionally, all other keyword arguments are passed to the constructor of the tensor.
 
-#### `.backward()`
+#### `.backward(self)`
 
 Backpropagates the gradients through the computation graph.
+
+#### `.reshape(self, shape, *args) -> Tensor`
+
+Reshapes a tensor to a new shape.
+
+#### `.expand(self, shape, *args) -> Tensor`
+
+Expands a tensor to a specified shape.
