@@ -14,7 +14,7 @@ Or if you just want to see some of the things tinygrad can do, check out the [sh
 
 ## API
 
-This is currently a big work in progress.
+See [here](/docs/api/) for the API reference.
 
 ## Resources
 
