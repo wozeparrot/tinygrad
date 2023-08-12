@@ -40,6 +40,31 @@ jobs:
     - name: Check <5000 lines
       run: sloccount tinygrad test examples extra; if [ $(sloccount tinygrad | sed -n 's/.*Total Physical Source Lines of Code (SLOC)[ ]*= \([^ ]*\).*/\1/p' | tr -d ',') -gt 5000 ]; then exit 1; fi
 
+  documentation:
+    name: Test Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+    - name: Set up Python 3.8
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.8
+    - name: Cache pip
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: testing
+    - name: Install Dependencies
+      run: pip install -e '.[testing]' --extra-index-url https://download.pytorch.org/whl/cpu
+    - name: Test Abstraction Docs
+      run: python docs/abstractions.py
+    - name: Test Quickstart
+      run: awk '/```python/{flag=1;next}/```/{flag=0}flag' docs/quickstart.md > quickstart.py && PYTHONPATH=. python3 quickstart.py
+
+
   testcpuimagenet:
     name: CPU and ImageNet to C Tests
     runs-on: ubuntu-latest
@@ -59,10 +84,6 @@ jobs:
         key: testing
     - name: Install Dependencies
       run: pip install -e '.[testing]' --extra-index-url https://download.pytorch.org/whl/cpu
-    - name: Test Docs
-      run: python docs/abstractions.py
-    - name: Test Quickstart
-      run: awk '/```python/{flag=1;next}/```/{flag=0}flag' docs/quickstart.md > quickstart.py && PYTHONPATH=. python3 quickstart.py
     - name: Run Pytest
       run: python -m pytest -n=auto test/ -k "not (test_efficientnet and models/test_train.py)"
     - name: Fuzz Test symbolic
