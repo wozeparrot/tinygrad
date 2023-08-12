@@ -14,7 +14,7 @@
 
 `float32` by default. Controls the default data type of created tensors.
 
-### `__init__(self, data: Union[int, float, list, LazyBuffer, np.ndarray], device:Optional[str]=None, dtype:Optional[DType]=None, requires_grad:Optional[bool]=None) -> Tensor`
+### Constructor `__init__(self, data: Union[int, float, list, LazyBuffer, np.ndarray], device:Optional[str]=None, dtype:Optional[DType]=None, requires_grad:Optional[bool]=None) -> Tensor`
 
 Creates a new tensor from the given data.
 
