@@ -2,6 +2,10 @@
 
 ## class `Tensor`
 
+```python
+from tinygrad.tensor import Tensor
+```
+
 ### Class Variables
 
 #### `training: bool`
@@ -199,3 +203,17 @@ Additionally, all other keyword arguments are passed to the constructor of the t
 #### `.backward()`
 
 Backpropagates the gradients through the computation graph.
+
+#### `.linear(weight:Tensor, bias:Optional[Tensor]=None)`
+
+Applies a linear transformation to the current tensor.
+
+```python
+x = Tensor.randn(128,20)
+w = Tensor.randn(20,30)
+b = Tensor.randn(128,30)
+output = x.linear(w)
+print(output)
+output = x.linear(w, b)
+print(output)
+```
