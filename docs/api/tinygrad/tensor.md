@@ -530,6 +530,127 @@ print(t.flatten(1).numpy()) #->
 """
 ```
 
+#### `.sum(self, axis=None, keepdim=False) -> Tensor`
+
+Sums a tensor along a specified axis.
+
+- `keepdim` keeps the dimensions of the tensor after summing.
+
+```python
+t = Tensor([[1, 2, 3], [4, 5, 6]])
+print(t.sum().numpy()) #-> 21.0
+print(t.sum(1).numpy()) #-> [ 6. 15.]
+print(t.sum(1, keepdim=True).numpy()) #->
+"""
+[[ 6.]
+ [15.]]
+"""
+```
+
+#### `.max(self, axis=None, keepdim=False) -> Tensor`
+
+Finds the maximum value of a tensor along a specified axis.
+
+- `keepdim` keeps the dimensions of the tensor after finding the maximum.
+
+```python
+t = Tensor([[1, 2, 3], [4, 5, 6]])
+print(t.max().numpy()) #-> 6.0
+print(t.max(1).numpy()) #-> [3. 6.]
+print(t.max(1, keepdim=True).numpy()) #->
+"""
+[[3.]
+ [6.]]
+"""
+```
+
+#### `.min(self, axis=None, keepdim=False) -> Tensor`
+
+Finds the minimum value of a tensor along a specified axis.
+
+- `keepdim` keeps the dimensions of the tensor after finding the minimum.
+
+```python
+t = Tensor([[1, 2, 3], [4, 5, 6]])
+print(t.min().numpy()) #-> 1.0
+print(t.min(1).numpy()) #-> [1. 4.]
+print(t.min(1, keepdim=True).numpy()) #->
+"""
+[[1.]
+ [4.]]
+"""
+```
+
+#### `.mean(self, axis=None, keepdim=False) -> Tensor`
+
+Computes the mean of a tensor along a specified axis.
+
+- `keepdim` keeps the dimensions of the tensor after computing the mean.
+
+```python
+t = Tensor([[1, 2, 3], [4, 5, 6]])
+print(t.mean().numpy()) #-> 3.5
+print(t.mean(1).numpy()) #-> [2. 5.]
+print(t.mean(1, keepdim=True).numpy()) #->
+"""
+[[2.]
+ [5.]]
+"""
+```
+
+#### `.std(self, axis=None, keepdim=False) -> Tensor`
+
+Computes the standard deviation of a tensor along a specified axis.
+
+- `keepdim` keeps the dimensions of the tensor after computing the standard deviation.
+
+```python
+t = Tensor([[1, 2, 3], [4, 5, 6]])
+print(t.std().numpy()) #-> 1.8708286
+print(t.std(1).numpy()) #-> [1. 1.]
+print(t.std(1, keepdim=True).numpy()) #->
+"""
+[[1.]
+ [1.]]
+"""
+```
+
+#### `.softmax(self, axis=-1) -> Tensor`
+
+Computes the softmax of a tensor along a specified axis.
+
+```python
+t = Tensor([[1, 2, 3], [4, 5, 6]])
+print(t.softmax().numpy()) #->
+"""
+[[0.09003057 0.24472848 0.66524094]
+ [0.09003057 0.24472848 0.66524094]]
+"""
+print(t.softmax(0).numpy()) #->
+"""
+[[0.04742588 0.04742588 0.04742588]
+ [0.95257413 0.95257413 0.95257413]]
+"""
+```
+
+#### `.log_softmax(self, axis=-1) -> Tensor`
+
+Computes the log softmax of a tensor along a specified axis.
+
+```python
+t = Tensor([[1, 2, 3], [4, 5, 6]])
+print(t.log_softmax().numpy()) #->
+"""
+[[-2.407606   -1.4076059  -0.40760595]
+ [-2.407606   -1.4076059  -0.40760595]]
+"""
+print(t.log_softmax(0).numpy()) #->
+"""
+[[-3.0485873  -3.0485873  -3.0485873 ]
+ [-0.04858733 -0.04858733 -0.04858733]]
+"""
+```
+
 #### `.linear(weight:Tensor, bias:Optional[Tensor]=None)`
 
 Applies a linear transformation to the current tensor.
