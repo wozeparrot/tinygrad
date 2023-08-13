@@ -57,6 +57,20 @@ t = Tensor([1, 2, 3], dtype=dtypes.int32)
 print(t.dtype) #-> dtypes.int
 ```
 
+#### `.T -> Tensor`
+
+A property that returns the transpose of the tensor.
+
+```python
+t = Tensor([[1, 2, 3], [4, 5, 6]])
+print(t.T.numpy()) #->
+"""
+[[1. 4.]
+ [2. 5.]
+ [3. 6.]]
+"""
+```
+
 ### Static Methods
 
 #### `Tensor.empty(*shape, **kwargs) -> Tensor`
