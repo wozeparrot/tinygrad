@@ -454,3 +454,31 @@ print(t.grad.numpy()) #->
  [1. 1. 1.]]
 """
 ```
+
+#### `.reshape(self, shape, *args) -> Tensor`
+
+Reshapes a tensor to a new shape. New shape can't be of 0-dimension.
+
+```python
+t1 = Tensor([1, 2, 3, 4, 5, 6])
+t2 = t1.reshape((1,6))
+print(t2.numpy()) #->
+"""
+[[1. 2. 3. 4. 5. 6.]]
+"""
+```
+
+#### `.expand(self, shape, *args) -> Tensor`
+
+Expands a tensor to a specified shape.
+
+```python
+t1 = Tensor([[1], [2], [3]])
+t2 = t1.expand(3, 4)
+print(t2.numpy()) #->
+"""
+[[1. 1. 1. 1.]
+ [2. 2. 2. 2.]
+ [3. 3. 3. 3.]]
+"""
+```
