@@ -430,7 +430,6 @@ print(t.device) #-> "CPU"
 
 Backpropagates the gradients through the computation graph.
 
-
 ```python
 t = Tensor.zeros(2, 3, requires_grad=True) + 1
 t.sum().backward()
