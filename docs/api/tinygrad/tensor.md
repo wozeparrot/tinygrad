@@ -480,7 +480,8 @@ print(t2.numpy()) #->
 [[1. 1. 1. 1.]
  [2. 2. 2. 2.]
  [3. 3. 3. 3.]]
- 
+"""
+
 #### `.linear(weight:Tensor, bias:Optional[Tensor]=None)`
 
 Applies a linear transformation to the current tensor.
