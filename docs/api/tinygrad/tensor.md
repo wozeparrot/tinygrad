@@ -354,6 +354,21 @@ print(t.numpy()) #->
 """
 ```
 
+#### `Tensor.stack(tensors, dim=0) -> Tensor`
+
+Stacks a list of tensors along a new dimension.
+
+```python
+t1 = Tensor.ones(3)
+t2 = Tensor.zeros(3)
+t = Tensor.stack([t1, t2])
+print(t.numpy()) #->
+"""
+[[1. 1. 1.]
+ [0. 0. 0.]]
+"""
+```
+
 ### Methods
 
 #### `.realize() -> Tensor`
@@ -439,6 +454,33 @@ print(t.grad.numpy()) #->
  [1. 1. 1.]]
 """
 ```
+
+#### `.reshape(self, shape, *args) -> Tensor`
+
+Reshapes a tensor to a new shape. New shape can't be of 0-dimension.
+
+```python
+t1 = Tensor([1, 2, 3, 4, 5, 6])
+t2 = t1.reshape((1,6))
+print(t2.numpy()) #->
+"""
+[[1. 2. 3. 4. 5. 6.]]
+"""
+```
+
+#### `.expand(self, shape, *args) -> Tensor`
+
+Expands a tensor to a specified shape.
+
+```python
+t1 = Tensor([[1], [2], [3]])
+t2 = t1.expand(3, 4)
+print(t2.numpy()) #->
+"""
+[[1. 1. 1. 1.]
+ [2. 2. 2. 2.]
+ [3. 3. 3. 3.]]
+ 
 #### `.linear(weight:Tensor, bias:Optional[Tensor]=None)`
 
 Applies a linear transformation to the current tensor.
@@ -446,7 +488,6 @@ Applies a linear transformation to the current tensor.
 ```python
 t = Tensor.randn(5,2)
 w = Tensor.randn(2,3)
-b = Tensor.randn(5,3)
 print(t.linear(w).numpy()) #->
 """
 [[ 1.5833756  -0.91409355 -0.84546614]
@@ -455,6 +496,7 @@ print(t.linear(w).numpy()) #->
  [-2.797903    0.7940688   1.1311363 ]
  [ 1.8159602  -1.7854995  -1.2953657 ]]
 """
+b = Tensor.randn(5,3)
 print(t.linear(w, b).numpy()) #->
 """
 [[ 3.360947   -0.05869228 -1.0911431 ]
@@ -462,5 +504,5 @@ print(t.linear(w, b).numpy()) #->
  [-0.19086033 -0.61030436 -1.898639  ]
  [-3.275361    0.4857852   1.0790952 ]
  [ 1.9292889  -1.3569635  -0.12129784]]
-"""
-```
+ """
+ ```
