@@ -497,6 +497,25 @@ print(t2.numpy()) #->
 """
 ```
 
+#### `.transpose(self, ax=1, ax2=0) -> Tensor`
+
+Transposes a tensor along two axes.
+
+```python
+t = Tensor([[[1, 2, 3], [4, 5, 6]]])
+print(t.transpose(0, 2).numpy()) #->
+"""
+[[[1.]
+  [4.]]
+
+ [[2.]
+  [5.]]
+
+ [[3.]
+  [6.]]]
+"""
+```
+
 #### `.linear(weight:Tensor, bias:Optional[Tensor]=None)`
 
 Applies a linear transformation to the current tensor.
