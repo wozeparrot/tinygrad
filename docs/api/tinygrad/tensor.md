@@ -354,6 +354,21 @@ print(t.numpy()) #->
 """
 ```
 
+#### `Tensor.stack(tensors, dim=0) -> Tensor`
+
+Stacks a list of tensors along a new dimension.
+
+```python
+t1 = Tensor.ones(3)
+t2 = Tensor.zeros(3)
+t = Tensor.stack([t1, t2])
+print(t.numpy()) #->
+"""
+[[1. 1. 1.]
+ [0. 0. 0.]]
+"""
+```
+
 ### Methods
 
 #### `.realize() -> Tensor`
