@@ -481,6 +481,7 @@ print(t2.numpy()) #->
  [2. 2. 2. 2.]
  [3. 3. 3. 3.]]
 """
+```
 
 #### `.linear(weight:Tensor, bias:Optional[Tensor]=None)`
 
