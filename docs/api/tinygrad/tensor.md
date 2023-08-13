@@ -516,6 +516,20 @@ print(t.transpose(0, 2).numpy()) #->
 """
 ```
 
+#### `.flatten(self, start_dim=0) -> Tensor`
+
+Flattens a tensor after a specified dimension.
+
+```python
+t = Tensor([[1, 2, 3], [4, 5, 6]])
+print(t.flatten().numpy()) #-> [1. 2. 3. 4. 5. 6.]
+print(t.flatten(1).numpy()) #->
+"""
+[[1. 2. 3.]
+ [4. 5. 6.]]
+"""
+```
+
 #### `.linear(weight:Tensor, bias:Optional[Tensor]=None)`
 
 Applies a linear transformation to the current tensor.
