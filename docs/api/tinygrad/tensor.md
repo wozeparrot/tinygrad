@@ -2,10 +2,6 @@
 
 ## class `Tensor`
 
-```python
-from tinygrad.tensor import Tensor
-```
-
 ### Class Variables
 
 #### `training: bool`
@@ -449,9 +445,23 @@ print(t.grad.numpy()) #->
 Applies a linear transformation to the current tensor.
 
 ```python
-t = Tensor.randn(128,20)
-w = Tensor.randn(20,30)
-b = Tensor.randn(128,30)
-print(t.linear(w).numpy())
-print(t.linear(w, b).numpy())
+t = Tensor.randn(5,2)
+w = Tensor.randn(2,3)
+b = Tensor.randn(5,3)
+print(t.linear(w).numpy()) #->
+"""
+[[ 1.5833756  -0.91409355 -0.84546614]
+ [-0.08422226  2.715486    1.2233448 ]
+ [-0.7796457  -0.35701907  0.05967392]
+ [-2.797903    0.7940688   1.1311363 ]
+ [ 1.8159602  -1.7854995  -1.2953657 ]]
+"""
+print(t.linear(w, b).numpy()) #->
+"""
+[[ 3.360947   -0.05869228 -1.0911431 ]
+ [ 1.6087391   2.7058008   2.1051977 ]
+ [-0.19086033 -0.61030436 -1.898639  ]
+ [-3.275361    0.4857852   1.0790952 ]
+ [ 1.9292889  -1.3569635  -0.12129784]]
+"""
 ```
