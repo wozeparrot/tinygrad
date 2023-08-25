@@ -137,7 +137,7 @@ class TransformerBlock:
 
     return self.jitted_norm_output(x, output) if do_jit else self.norm_output(x, output)
 
-GPU_COUNT = 6
+GPU_COUNT = getenv("GPU_COUNT", 6)
 
 class Transformer:
   def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, linear=Linear, max_batch_size=32, max_seq_len=1024, ffn_dim_multiplier=None, n_kv_heads=None):
