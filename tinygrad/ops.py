@@ -1,9 +1,9 @@
 from __future__ import annotations
-import functools, time
+import time
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Union, Type, Tuple, Any, List, Optional, Dict, Callable, cast
-from tinygrad.helpers import ansilen, prod, DEBUG, getenv, GlobalCounters, DType, colored, dedup
-from tinygrad.shape.shapetracker import MovementOps
+from tinygrad.helpers import ansilen, prod, DEBUG, getenv, GlobalCounters, DType, colored, dedup, merge_dicts
+from tinygrad.shape.symbolic import Variable, sym_infer
 from tinygrad.runtime.lib import RawBuffer, RawConst, buf_is_kernel_arg
 if TYPE_CHECKING:
   from tinygrad.lazy import LazyBuffer
@@ -16,13 +16,13 @@ class UnaryOps(Enum): NOOP = auto(); EXP2 = auto(); LOG2 = auto(); CAST = auto()
 class BinaryOps(Enum): ADD = auto(); SUB = auto(); MUL = auto(); DIV = auto(); MAX = auto(); MOD = auto(); CMPLT = auto() # noqa: E702
 class ReduceOps(Enum): SUM = auto(); MAX = auto() # noqa: E702
 class TernaryOps(Enum): MULACC = auto(); WHERE = auto() # noqa: E702
+class MovementOps(Enum): RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); SHRINK = auto(); STRIDE = auto() # noqa: E702
 class LoadOps(Enum): EMPTY = auto(); RAND = auto(); CONST = auto(); FROM = auto(); CONTIGUOUS = auto(); CUSTOM = auto() # noqa: E702
 
 Op = Union[UnaryOps, BinaryOps, ReduceOps, MovementOps, LoadOps, TernaryOps]
 OpType = Union[Type[UnaryOps], Type[BinaryOps], Type[ReduceOps], Type[MovementOps], Type[LoadOps], Type[TernaryOps]]
 
 class LazyOp:
-  # TODO: add dest to support multiple outputs. on second thought, multiple outputs will have multiple LazyOps.
   __slots__ = "op", "src", "arg", "buffers", "__weakref__"
   op: Op
   src: Tuple[Union[LazyOp, LazyBuffer], ...]
@@ -53,9 +53,9 @@ class LazyOp:
   def get_lazyops(self) -> List[LazyOp]: return [self] + [item for x in self.src for item in x.get_lazyops()]
 
   def replace_with_movement_ops(self:LazyOp, ops:List[Tuple[MovementOps, Tuple[Any, ...]]]) -> 'LazyBuffer':
-    from tinygrad.lazy import elementwise_op
     assert self.op in BinaryOps or self.op in UnaryOps or self.op in TernaryOps
-    return elementwise_op(self.op, *[z.replace_with_movement_ops(ops) for z in self.src], arg=self.arg)   # type: ignore
+    srcs = [z.replace_with_movement_ops(ops) for z in self.src]
+    return srcs[0].e(self.op, *srcs[1:], arg=self.arg)   # type: ignore
 
   @property
   def st(self): raise NotImplementedError
@@ -109,13 +109,11 @@ class FlopCounter:
   def consume_flops(self):
     self.flops, ret = 0, self.flops
     return ret
-from tinygrad.shape.shapetracker import ShapeTracker
 shape_fxn_for_op: Dict[Op, Callable] = {
   UnaryOps.CAST: lambda self,arg: (self.shape, arg[0], self.consume_flops()),   # cast uses no flops
   **{op:lambda self: (self.shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in UnaryOps if op != UnaryOps.CAST},
   **{op:lambda self,y: (self.shape, max(self.dtype, y.dtype), self.consume_flops() + y.consume_flops() + prod(self.shape)) for op in BinaryOps},
   **{op:lambda self,new_shape: (new_shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in ReduceOps},
-  **{op:functools.partial(lambda mop,self,arg: (ShapeTracker(self.shape).movement_op(mop, arg).shape, self.dtype, self.consume_flops()), op) for op in MovementOps},
   TernaryOps.WHERE: lambda self,y,z: (self.shape, self.dtype, self.consume_flops() + y.consume_flops() + z.consume_flops() + prod(self.shape))}
 InterpretedFlopCounter = Interpreted(FlopCounter, shape_fxn_for_op, lambda x: FlopCounter((x.shape, x.dtype, 0)), lambda x: x)
 def get_lazyop_info(ast:LazyOp) -> FlopCounter: return InterpretedFlopCounter.exec_ast(ast)
@@ -131,20 +129,24 @@ class ASTRunner:
     self.clprg = runtime(self.name, self.prg, **self.runtime_args)
     return self
 
-  def exec(self, bufs, force_wait=False, optimizing=False) -> Optional[float]:
+  def exec(self, bufs, var_vals:Optional[Dict[Variable, int]]=None, force_wait=False, optimizing=False) -> Optional[float]:
     rawbufs = dedup([x.realized for x in bufs if buf_is_kernel_arg(x)])
-    if GlobalCounters.cache is not None and not optimizing: GlobalCounters.cache.append((self, rawbufs))
-    return self(rawbufs, force_wait=force_wait)
+    if GlobalCounters.cache is not None and not optimizing: GlobalCounters.cache.append((self, rawbufs, var_vals if var_vals is not None else {}))
+    return self(rawbufs, var_vals, force_wait=force_wait)
 
-  def __call__(self, rawbufs:List[RawBuffer], jit=False, force_wait=False) -> Optional[float]:
-    if et := self.clprg((self.global_size + [1]*(3-len(self.global_size))) if self.global_size is not None else None,
-                        (self.local_size + [1]*(3-len(self.local_size))) if self.local_size is not None else None,
-                        *rawbufs, wait=force_wait or DEBUG>=1): GlobalCounters.time_sum_s += et
+  def __call__(self, rawbufs:List[RawBuffer], var_vals:Optional[Dict[Variable, int]]=None, jit=False, force_wait=False) -> Optional[float]:
+    if var_vals is None: var_vals = {}
+    global_size = [sym_infer(sz, var_vals) for sz in self.global_size] if self.global_size is not None else self.global_size
+    local_size = [sym_infer(sz, var_vals) for sz in self.local_size] if self.local_size is not None else self.local_size
+    if et := self.clprg((global_size + [1]*(3-len(global_size))) if global_size is not None else None,
+                        (local_size + [1]*(3-len(local_size))) if local_size is not None else None,
+                        *rawbufs, *var_vals.values(), wait=force_wait or DEBUG>=1): GlobalCounters.time_sum_s += et
+    op_estimate = sym_infer(self.op_estimate, var_vals)
     if DEBUG >= 2:
-      print(f"{colored(f'*** {GlobalCounters.kernel_count:4d}', 'magenta' if jit else None)} {(self.display_name+' '*(33-ansilen(self.display_name))) if self.display_name is not None else self.name:33s} arg {len(rawbufs):3d} sz {str(self.global_size):18s} {str(self.local_size):12s} OPs {int(self.op_estimate/1e6):6d}M/{GlobalCounters.global_ops/1e9:7.2f}G  mem {GlobalCounters.mem_used/1e9:5.2f} GB " +
-            (str() if et is None else f"tm {et*1e6:9.2f}us/{GlobalCounters.time_sum_s*1e3:9.2f}ms ({self.op_estimate/((et or 1e-20)*1e9):8.2f} GFLOPS, {self.mem_estimate/((et or 1e-20)*1e9):7.2f} GB/s)"))
+      print(f"{colored(f'*** {GlobalCounters.kernel_count:4d}', 'magenta' if jit else None)} {(self.display_name+' '*(33-ansilen(self.display_name))) if self.display_name is not None else self.name:33s} arg {len(rawbufs):3d} sz {str(global_size):18s} {str(local_size):12s} OPs {int(op_estimate/1e6):6d}M/{GlobalCounters.global_ops/1e9:7.2f}G  mem {GlobalCounters.mem_used/1e9:5.2f} GB " +
+            (str() if et is None else f"tm {et*1e6:9.2f}us/{GlobalCounters.time_sum_s*1e3:9.2f}ms ({op_estimate/((et or 1e-20)*1e9):8.2f} GFLOPS, {self.mem_estimate/((et or 1e-20)*1e9):7.2f} GB/s)"))
     GlobalCounters.kernel_count += 1
-    GlobalCounters.global_ops += self.op_estimate
+    GlobalCounters.global_ops += op_estimate
     GlobalCounters.global_mem += self.mem_estimate
     if getenv("EARLY_STOPPING") and GlobalCounters.kernel_count == getenv("EARLY_STOPPING"): exit(0)
     return et
@@ -178,9 +180,11 @@ class Compiled:
           output.realized = None
           break
 
-    # we don't have an output buffer, we have to create it
+    # we don't have an output buffer, we have to create it, and create to max size if it has symbolic shape
     if not output.realized:
-      output.realized = self.buffer(prod(output.shape), output.dtype, **kwargs)
+      output.realized = self.buffer(prod((s if isinstance(s, int) else s.max for s in output.shape)), output.dtype, **kwargs)
+    # update the output var_vals from src
+    output.st.var_vals = dict(sorted(merge_dicts([buf.st.var_vals for buf in ast.buffers]).items(), key=lambda kv:cast(Variable,kv[0]).key))
 
     from tinygrad.codegen.linearizer import Linearizer
     k = Linearizer(ast, output, self.linearizer_opts)
@@ -200,5 +204,5 @@ class Compiled:
 
     if prg.name == getenv("PRINT_PRG", ''): print(prg.prg)
 
-    prg.exec(k.bufs)
+    prg.exec(k.bufs, var_vals=output.st.var_vals)
     return output.realized

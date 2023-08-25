@@ -16,6 +16,7 @@ from tinygrad.tensor import Tensor
 from tinygrad.nn import Embedding, Linear
 from tinygrad.ops import GlobalCounters
 from tinygrad.jit import TinyJit
+from tinygrad.shape.symbolic import Variable, sym_infer
 
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -61,41 +62,32 @@ class Attention:
     self.head_dim = dim // n_heads
     self.n_rep = self.n_heads // self.n_kv_heads
 
-    self.wq = linear(dim, n_heads * self.head_dim, bias=False)
-    self.wk = linear(dim, n_kv_heads * self.head_dim, bias=False)
-    self.wv = linear(dim, n_kv_heads * self.head_dim, bias=False)
-    self.wo = linear(n_heads * self.head_dim, dim, bias=False)
+    self.wq = linear(dim, self.n_heads * self.head_dim, bias=False)
+    self.wk = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+    self.wv = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+    self.wo = linear(self.n_heads * self.head_dim, dim, bias=False)
 
-  def prepare_attention(self, x:Tensor, freqs_cis:Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+  def __call__(self, x:Tensor, cache_k:Tensor, cache_v:Tensor, start_pos:int, freqs_cis:Tensor, mask:Optional[Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+    bsz, seqlen, _ = x.shape
     xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
     xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
     xk = xk.reshape(xk.shape[0], xk.shape[1], self.n_kv_heads, self.head_dim)
     xv = xv.reshape(xv.shape[0], xv.shape[1], self.n_kv_heads, self.head_dim)
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-    return xq, xk, xv
 
-  def inner_attention(self, xq:Tensor, xk:Tensor, xv:Tensor, start_pos:int, mask:Optional[Tensor]) -> Tensor:
-    bsz, seqlen, _, _ = xq.shape
     # kv caching!
     if start_pos == 0:
       keys, values = xk, xv
     else:
-      assert hasattr(self, 'cache_k'), "no cache"
-      assert start_pos == self.cache_k.shape[1] and start_pos == self.cache_v.shape[1], "cache is wrong shape"
+      assert cache_k.shape[0] > 0, "no cache"
+      assert start_pos == sym_infer(cache_k.shape[1], cache_k.lazydata.st.var_vals) == sym_infer(cache_v.shape[1], cache_v.lazydata.st.var_vals), f"cache has wrong shape, not ({start_pos} == {sym_infer(cache_k.shape[1], cache_k.lazydata.st.var_vals)} == {sym_infer(cache_v.shape[1], cache_v.lazydata.st.var_vals)})"
       assert seqlen == xk.shape[1] and seqlen == xv.shape[1], "seqlen is wrong shape?!?"
-      keys, values = self.cache_k.cat(xk, dim=1), self.cache_v.cat(xv, dim=1)
+      keys, values = cache_k.cat(xk, dim=1), cache_v.cat(xv, dim=1)
 
-    # save the cache
-    self.cache_k, self.cache_v = keys.realize(), values.realize()
-
-    keys, values = repeat_kv(keys, self.n_rep), repeat_kv(values, self.n_rep)
-    return Tensor.scaled_dot_product_attention(xq.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2), mask).transpose(1, 2).reshape(bsz, seqlen, -1)
-
-  # NOTE: this is not called
-  def __call__(self, x:Tensor, start_pos:int, freqs_cis:Tensor, mask:Optional[Tensor]) -> Tensor:
-    xq, xk, xv = self.prepare_attention(x, freqs_cis)
-    output = self.inner_attention(xq, xk, xv, start_pos, mask)
-    return self.wo(output)
+    cache_k, cache_v = keys, values
+    keys, values = repeat_kv(keys, self.n_rep).realize(), repeat_kv(values, self.n_rep).realize()
+    attn = Tensor.scaled_dot_product_attention(xq.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2), mask).transpose(1, 2).reshape(bsz, seqlen, -1)
+    return self.wo(attn).realize(), cache_k.realize(), cache_v.realize()
 
 class FeedForward:
   def __init__(self, dim, hidden_dim, multiple_of, linear=Linear, ffn_dim_multiplier=None):
@@ -118,26 +110,34 @@ class TransformerBlock:
     self.feed_forward = FeedForward(dim, 4*dim, multiple_of, linear, ffn_dim_multiplier)
     self.attention_norm = RMSNorm(dim, norm_eps)
     self.ffn_norm = RMSNorm(dim, norm_eps)
-    if getenv("JIT"):
-      self._pre = TinyJit(self.pre)
-      self._post = TinyJit(self.post)
-    else:
-      self._pre, self._post = self.pre, self.post
+    self.cache_k, self.cache_v = None, None
 
-  def pre(self, x:Tensor, freqs_cis:Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-    xq, xk, xv = self.attention.prepare_attention(self.attention_norm(x), freqs_cis)
-    return xq.realize(), xk.realize(), xv.realize()
+    self.jitted_attention_norm = TinyJit(lambda x: self.attention_norm(x).realize())
+    self.jitted_attn = TinyJit(self.attention.__call__)
+    self.jitted_norm_output = TinyJit(self.norm_output)
 
-  def post(self, x:Tensor, output:Tensor) -> Tensor:
-    h = x + self.attention.wo(output)
+  def norm_output(self, x:Tensor, output:Tensor) -> Tensor:
+    h = x + output
     return (h + self.feed_forward(self.ffn_norm(h))).realize()
 
   def __call__(self, x:Tensor, start_pos:int, freqs_cis:Tensor, mask:Optional[Tensor]):
-    # if mask is not None, x's shape is dymanic based on user input and pre/post can't be jitted
-    xq, xk, xv = self._pre(x, freqs_cis) if mask is None else self.pre(x, freqs_cis)
-    # inner_attention can't be jitted because it's dynamic based on start_pos
-    output = self.attention.inner_attention(xq, xk, xv, start_pos, mask)
-    return self._post(x, output) if mask is None else self.post(x, output)
+    bsz, seqlen, _ = x.shape
+    do_jit = getenv("JIT") and mask is None
+    if do_jit:
+      pos = Variable("pos", 1, 1024)
+      self.cache_k = self.cache_k.reshape(self.cache_k.shape[0], pos, self.cache_k.shape[2], self.cache_k.shape[3])
+      self.cache_v = self.cache_v.reshape(self.cache_v.shape[0], pos, self.cache_v.shape[2], self.cache_v.shape[3])
+      output, cache_k, cache_v = self.jitted_attn(self.jitted_attention_norm(x), self.cache_k, self.cache_v, start_pos, freqs_cis, mask)
+    else:
+      output, cache_k, cache_v = self.attention(self.attention_norm(x), self.cache_k, self.cache_v, start_pos, freqs_cis, mask)
+
+    # save the cache. with symbolic shape, cast it back to int shape so we have int shape in cache
+    self.cache_k = cache_k.reshape(cache_k.shape[0], start_pos+seqlen, cache_k.shape[2], cache_k.shape[3]).realize()
+    self.cache_v = cache_v.reshape(cache_v.shape[0], start_pos+seqlen, cache_v.shape[2], cache_v.shape[3]).realize()
+
+    return self.jitted_norm_output(x, output) if do_jit else self.norm_output(x, output)
+
+GPU_COUNT = 6
 
 class Transformer:
   def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, linear=Linear, max_batch_size=32, max_seq_len=1024, ffn_dim_multiplier=None, n_kv_heads=None):
@@ -145,48 +145,58 @@ class Transformer:
     self.freqs_cis = []
 
     # scuffed
-    for _ in range(n_layers % 6):
+    for _ in range(n_layers % GPU_COUNT):
       Device.DEFAULT = Device.canonicalize("gpu:0")
       self.layers.append(TransformerBlock(dim, multiple_of, n_heads, n_kv_heads, norm_eps, linear, ffn_dim_multiplier))
-    for gpu in range(6):
+    for gpu in range(GPU_COUNT):
       Device.DEFAULT = Device.canonicalize(f"gpu:{gpu}")
-      for _ in range(n_layers // 6):
+      for _ in range(n_layers // GPU_COUNT):
         self.layers.append(TransformerBlock(dim, multiple_of, n_heads, n_kv_heads, norm_eps, linear, ffn_dim_multiplier))
       self.freqs_cis.append(Tensor(precompute_freqs_cis(dim // n_heads, max_seq_len * 2)))
 
     self.norm = RMSNorm(dim, norm_eps)
     self.output = linear(dim, vocab_size, bias=False)
+    self.norm_output = lambda x: self.output(self.norm(x))
+    self.jitted_norm_output = TinyJit(lambda x: self.norm_output(x).realize())
 
     Device.DEFAULT = Device.canonicalize("clang")
     self.tok_embeddings = Embedding(vocab_size, dim)
+    self.jitted_tok_embeddings = TinyJit(lambda x: self.tok_embeddings(x).realize())
 
   def __call__(self, tokens:Tensor, start_pos:int):
     _bsz, seqlen = tokens.shape
+    do_jit = getenv("JIT") and seqlen > 1
     Device.DEFAULT = Device.canonicalize("clang")
-    h = self.tok_embeddings(tokens.to(Device.DEFAULT)).realize()
+    h = self.jitted_tok_embeddings(tokens.to(Device.DEFAULT)) if do_jit else self.tok_embeddings(tokens.to(Device.DEFAULT)).realize()
 
     Device.DEFAULT = Device.canonicalize("gpu:0")
     # get only the part we are using. making it contiguous avoids more kernel calls
-    freqs_cis = [fc[:, start_pos:start_pos+seqlen].contiguous().realize() for fc in self.freqs_cis]
+    if do_jit:
+      pos = Variable("pos", 1, 1024)
+      assert seqlen == 1, "seqlen > 1 not supported for JIT"
+      freqs_cis = [fc.shrink(((0, fc.shape[0]), (pos, pos+seqlen),(0, fc.shape[2]),(0, fc.shape[3]),(0, fc.shape[4]))) for fc in self.freqs_cis]
+      for fc in freqs_cis: fc.lazydata.st.var_vals[pos] = start_pos
+    else:
+      freqs_cis = [fc.shrink(((0, fc.shape[0]), (start_pos, start_pos+seqlen),(0, fc.shape[2]),(0, fc.shape[3]),(0, fc.shape[4]))) for fc in self.freqs_cis]
 
     h = h.to(Device.DEFAULT)
-    for i in range(self.n_layers % 6):
+    for i in range(self.n_layers % GPU_COUNT):
       mask = Tensor.full((1, 1, seqlen, start_pos + seqlen), float("-inf"), dtype=dtypes.float32).triu(start_pos+1).realize() if seqlen > 1 else None
       h = self.layers[i](h, start_pos=start_pos, freqs_cis=freqs_cis[0], mask=mask)
-    for gpu in range(6):
+    for gpu in range(GPU_COUNT):
       Device.DEFAULT = Device.canonicalize(f"gpu:{gpu}")
       h = h.to(Device.DEFAULT)
       mask = Tensor.full((1, 1, seqlen, start_pos + seqlen), float("-inf"), dtype=dtypes.float32).triu(start_pos+1).realize() if seqlen > 1 else None
-      for i in range(self.n_layers // 6):
-        h = self.layers[i + (gpu * (self.n_layers // 6)) + (self.n_layers % 6)](h, start_pos=start_pos, freqs_cis=freqs_cis[gpu], mask=mask)
+      for i in range(self.n_layers // GPU_COUNT):
+        h = self.layers[i + (gpu * (self.n_layers // GPU_COUNT)) + (self.n_layers % GPU_COUNT)](h, start_pos=start_pos, freqs_cis=freqs_cis[gpu], mask=mask)
 
-    return self.output(self.norm(h))
+    return self.jitted_norm_output(h) if do_jit else self.output(self.norm(h))
 
 # **** files and arguments ****
 
 VOCAB_SIZE = 32000
 MODEL_PARAMS = {
-  1: {
+  "1": {
     "7B": {
       "args": {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE},
       "files": 1,
@@ -204,7 +214,7 @@ MODEL_PARAMS = {
       "files": 8,
     },
   },
-  2: {
+  "2": {
     "7B": {
       "args": {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE},
       "files": 1,
@@ -218,13 +228,27 @@ MODEL_PARAMS = {
       "files": 8,
     },
   },
+  "Code": {
+    "7B-Python": {
+      "args": {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE},
+      "files": 1,
+    },
+    "13B-Python": {
+      "args": {"dim": 5120, "multiple_of": 256, "n_heads": 40, "n_layers": 40, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE},
+      "files": 2,
+    },
+    "34B-Python": {
+      "args": {"dim": 8192, "multiple_of": 256, "n_heads": 64, "n_kv_heads": 8, "n_layers": 48, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE},
+      "files": 4,
+    },
+  }
 }
 
 # **** helper functions ****
 def sample(logits, temperature):
   if temperature < 1e-6:
     # so close to 0 we use argmax
-    return int(logits.numpy().argmax())
+    return int(logits.argmax().numpy())
   else:
     probs = (logits / temperature).softmax()
     probs = probs.numpy().flatten()
@@ -249,29 +273,29 @@ class AbsmaxQuantizedLinear:
     self.scale = Tensor.ones(out_features, dtype=dtypes.half)
 
   def __call__(self, x):
-    return x.dot(self.weight.cast(dtype=dtypes.half).T/self.scale)
+    return x.dot(self.weight.cast(dtype=dtypes.half).T*self.scale)
 
   @staticmethod
   def quantize(tensors):
     new_tensors = {}
     for name,v in tensors.items():
       if 'feed_forward' in name or ('attention.w') in name or name == 'output.weight':
-        scale = 127.0 / v.abs().max(axis=1)
-        int8_weight = (v.T*scale).T.cast(dtype=dtypes.int8)
-        new_tensors[name] = int8_weight
-        new_tensors[name.replace('weight', 'scale')] = scale
+        scale = v.abs().max(axis=1) / 127.0
+        int8_weight = (v.T/scale).T.cast(dtype=dtypes.int8)
+        new_tensors[name] = int8_weight.realize()
+        new_tensors[name.replace('weight', 'scale')] = scale.realize()
       else:
         new_tensors[name] = v
     return new_tensors
 
 class LLaMa:
   @staticmethod
-  def build(model_path, tokenizer_path, model_gen=1, model_size="7B", quantize=False):
+  def build(model_path, tokenizer_path, model_gen="1", model_size="7B", quantize=False):
     from sentencepiece import SentencePieceProcessor
     sp_model = SentencePieceProcessor(model_file=str(tokenizer_path))
     assert sp_model.vocab_size() == VOCAB_SIZE
 
-    from tinygrad.state import torch_load, load_state_dict
+    from tinygrad.nn.state import torch_load, load_state_dict
     params = MODEL_PARAMS[model_gen][model_size]
     model = Transformer(**params["args"], linear=AbsmaxQuantizedLinear) if quantize else Transformer(**params["args"])
     weights = concat_weights([torch_load(filename) for filename in [f"{model_path}/{model_size}/consolidated.{i:02d}.pth" for i in range(params["files"])]])
@@ -318,8 +342,8 @@ if __name__ == "__main__":
   parser.add_argument('--temperature', type=float, default=0.7, help="Temperature in the softmax")
   parser.add_argument('--timing', action='store_true', help="Print timing per token")
   parser.add_argument('--profile', action='store_true', help="Output profile data to out.prof")
-  parser.add_argument('--size', type=str, default="7B", help="Size of model to use [7B, 13B, 30B, 65B] for Gen 1, [7B, 13B, 70B] for Gen 2")
-  parser.add_argument('--gen', type=int, default="1", help="Generation of the model to use [1, 2]")
+  parser.add_argument('--size', type=str, default="7B", help="Size of model to use [7B, 13B, 30B, 65B] for Gen 1, [7B, 13B, 70B] for Gen 2, [7B, 13B, 34B] for Code")
+  parser.add_argument('--gen', type=str, default="1", help="Generation of the model to use [1, 2, Code]")
   parser.add_argument('--quantize', action='store_true', help="Quantize the weights to int8 in memory")
 
   args = parser.parse_args()
@@ -415,7 +439,7 @@ After you are done speaking, output [EOS]. You are not Chad.
   # *** prompt engineers stop here ****
 
 
-  LLAMA_SUFFIX = {1: "", 2: "-2"}[args.gen]
+  LLAMA_SUFFIX = {"1": "", "2": "-2", "Code": "-Code"}[args.gen]
   WEIGHTS_DIR = Path(__file__).parent.parent / f"weights/LLaMA{LLAMA_SUFFIX}/"
   TOKENIZER_FILENAME = WEIGHTS_DIR / "tokenizer.model"
   print(f"using LLaMA{LLAMA_SUFFIX}-{args.size} model")
@@ -457,6 +481,7 @@ After you are done speaking, output [EOS]. You are not Chad.
 
     last_break = len(outputted)
     for i in range(args.count):
+      GlobalCounters.reset()
       if args.profile and i == 2: profiler.enable()
 
       if args.timing: print("")
