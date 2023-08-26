@@ -676,3 +676,44 @@ print(t.linear(w, b).numpy()) #->
  [ 1.9292889  -1.3569635  -0.12129784]]
 """
 ```
+
+#### `.sequential(self, ll:List[Callable[[Tensor], Tensor]])`
+
+Applies a list of Tensor self-defined transformations to the current tensor.
+
+```python
+t = Tensor.arange(9)
+
+def add(x:Tensor) -> Tensor:
+  return x+1
+
+L = [
+  lambda x: x / 3.0,
+  lambda x: x.reshape((3,3)),
+  lambda x: add(x)
+]
+print(t.sequential(L).numpy()) #->
+"""
+[[1.        1.3333334 1.6666667]
+ [2.        2.3333335 2.6666667]
+ [3.        3.3333335 3.6666667]]
+"""
+```
+
+#### `.layernorm(self, axis=-1, eps:float=1e-5)`
+
+$\begin{aligned}y=\frac{x-E[x]}{\sqrt{Var[x]+\epsilon}}\end{aligned}$
+
+Unless specified, the mean and standard-deviation are calculated over the last dimension.
+
+See `LayerNorm`, `LayerNorm2d` for details
+
+#### `.batchnorm(self, weight:Optional[Tensor], bias:Optional[Tensor], mean:Tensor, invstd:Tensor)`
+
+Applies batch normalization for each channel across a batch of data with 2D inputs
+
+See `Batchnorm2d` for details.
+
+#### `.dropout(self, p=0.5)`
+
+#### `.scaled_dot_product_attention(self, key:Tensor, value:Tensor, attn_mask:Optional[Tensor]=None, dropout_p:float=0.0, is_causal:bool=False)`
