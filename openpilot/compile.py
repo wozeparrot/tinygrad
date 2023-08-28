@@ -25,7 +25,7 @@ from extra.utils import fetch
 from extra.onnx import get_run_onnx
 from tinygrad.tensor import Tensor
 
-OPENPILOT_MODEL = "https://github.com/commaai/openpilot/raw/6c5693e965b9c63f8678f52b9e9b5abe35f23feb/selfdrive/modeld/models/supercombo.onnx"
+OPENPILOT_MODEL = "https://github.com/commaai/openpilot/raw/v0.9.4/selfdrive/modeld/models/supercombo.onnx"
 
 np.random.seed(1337)
 def get_random_input_tensors(input_shapes):
@@ -69,7 +69,7 @@ def compile(dat, output_fn):
   # transform to CL.CACHE
   used_ops = 0
   cl_cache = []
-  for prg,args in model_exec.jit_cache:
+  for prg,args,_ in model_exec.jit_cache:
     # pass these to thneed
     setattr(prg.clprg, 'op_estimate', prg.op_estimate)
     setattr(prg.clprg, 'prg', prg.prg)

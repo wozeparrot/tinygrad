@@ -3,18 +3,26 @@ import itertools, math
 from collections import defaultdict
 from enum import Enum, auto
 
-from tinygrad.helpers import dedup, colored, ImageDType, DEBUG, prod, dtypes, mnum, DType, all_same, partition
-from tinygrad.ops import LazyOp, FlopCounter, get_lazyop_info, UnaryOps
+from tinygrad.helpers import colored, ImageDType, DEBUG, dtypes, mnum, DType, all_same, partition
+from tinygrad.ops import LazyOp, UnaryOps, Op
 from tinygrad.lazy import LazyBuffer
-from tinygrad.ops import MovementOps, ReduceOps, BinaryOps, TernaryOps
-from tinygrad.runtime.lib import RawConst, buf_is_kernel_arg
-from tinygrad.shape.shapetracker import ShapeTracker, strides_for_shape, View
-from tinygrad.shape.symbolic import Variable, NumNode, Node, SumNode, MulNode
+from tinygrad.ops import ReduceOps, BinaryOps, TernaryOps
+from tinygrad.runtime.lib import RawConst
+from tinygrad.shape.shapetracker import ShapeTracker
+from tinygrad.shape.symbolic import Variable, NumNode, Node, SumNode, MulNode, sym_rename
+from tinygrad.codegen.optimizer import OptimizedKernel
+from tinygrad.codegen.kernel import LocalBuffer, LinearizerOptions # noqa: F401 # pylint:disable=unused-import
 VariableOrNum = Union[Variable, NumNode, Node]
 
 # bottom ones are asm only
-class UOps(Enum): LOOP = auto(); DEFINE_LOCAL = auto(); DEFINE_GLOBAL = auto(); LOAD = auto(); ALU = auto(); ENDLOOP = auto(); STORE = auto(); CAST = auto(); BARRIER = auto(); WMMA = auto(); \
-                  SPECIAL = auto(); DEFINE_REGISTER = auto(); LABEL = auto(); COND_BRANCH = auto() # noqa: E702
+class UOps(Enum):
+  LOOP = auto(); ENDLOOP = auto() # loops can be global, local, or other # noqa: E702
+  DEFINE_GLOBAL = auto(); DEFINE_LOCAL = auto() # this defines buffers # noqa: E702
+  LOAD = auto(); STORE = auto(); BARRIER = auto() # noqa: E702
+  ALU = auto(); WMMA = auto(); CAST = auto() # noqa: E702
+  # TODO: add CONST. use ALU WHERE for gated load
+  # *** assembly only UOps ***
+  SPECIAL = auto(); LABEL = auto(); COND_BRANCH = auto() # TODO: replace these with LOOP and ENDLOOP # noqa: E702
 
 def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node, validhacks=False) -> Tuple[Node, Node]:
   idy = (idxy//(4*base_shape[1]))
@@ -35,13 +43,6 @@ def to_image_idx(base_shape:Tuple[int, ...], idxy:Node, valid:Node, validhacks=F
     idx = (idxy//4)%base_shape[1]
   if DEBUG >= 5: print("to_image_idx", base_shape, idx.min, idx.max, idy.min, idy.max, idx, idy)
   return idx, idy
-
-class LocalBuffer(NamedTuple):
-  name: str
-  size: int
-  dtype: DType = dtypes.float32
-  realized: None = None
-  def __str__(self): return f"localbuffer<{self.name}[{self.size}]>"
 
 class Token(NamedTuple):
   name: str
@@ -112,19 +113,19 @@ def expand_idxs(idxs:Sequence[Node]) -> Iterator[Tuple[Node, ...]]:
 
 class MemOp(NamedTuple):
   name: str
-  idx: Variable
+  idx: Node
   local: bool
   memory_dtype: DType
 
   # shared
-  valid: Variable
+  valid: Node
   invalid_value: Union[float, int] = 0.0
 
 class ConstOp(NamedTuple):
   value: Union[float, int]
 
   # shared
-  valid: Variable
+  valid: Node
   invalid_value: Union[float, int] = 0.0
 
 class UOp(NamedTuple):
@@ -134,99 +135,14 @@ class UOp(NamedTuple):
   arg: Any
   def __repr__(self): return f"{str(self.uop):20s}: {str(self.out) if self.out is not None else '':25s} {str(self.vin):32s} {self.arg}"
 
-class LinearizerOptions(NamedTuple):
-  # TODO: make this generic with a list of supported types
-  supports_float4: bool = True
-  supports_float4_alu: bool = True
-  has_local: bool = True
-  # NOTE: these two should be in z,y,x(reversed) order for cstyle backends, they are flipped when kernel is rendered
-  global_max: Optional[List[int]] = None
-  local_max: Optional[List[int]] = None
-
-class Linearizer:
-  def __init__(self, ast:LazyOp, output_buffer:LazyBuffer, opts:LinearizerOptions):
-    # NOTE: if there's a RESHAPE, we skip it. the output shape is set from the reduce op or a latebuf
-    self.ast = ast.src[0] if ast.op == MovementOps.RESHAPE else ast
-    self.opts = opts
-
-    # get the output buffers
-    self.bufs = [output_buffer] + dedup(ast.buffers)
-    self.arg_bufs = {x:f"data{i}" for i,x in enumerate(dedup([x.realized for x in self.bufs if buf_is_kernel_arg(x)]))}
-
-    # key for lookup in cache (can change, str might not be right)
-    # bufs are needed because kernels like f(x) = x + x and f(x, y) = x + y have the same str(ast), but are different kernels.
-    # mapping the buffers to integers is required because a-b != b-a (and how would you tell a and b apart?)
-    self.key = (ast.map_buffers({x:(self.arg_bufs[x.realized] if x.realized in self.arg_bufs else x) for x in self.bufs}).key, tuple([x.key for x in self.bufs]))
-
+class Linearizer(OptimizedKernel):
   def get_buffer_name(self, i):
     if self.bufs[i].__class__ == LocalBuffer: return self.bufs[i].name
     assert self.bufs[i].realized.__class__ is not RawConst  # constants shouldn't be loaded with memops
     return self.arg_bufs[self.bufs[i].realized]
 
-  def process(self) -> None:
-    if hasattr(self, "sts"): return   # already processed
-
-    # fetch lazyop info
-    self.info: FlopCounter = get_lazyop_info(cast(LazyOp, self.ast))
-    self.mem_estimate: int = sum(x.dtype.itemsize*(x.realized.size if x.realized is not None else prod(x.shape)) for x in self.bufs if x is not None)
-
-    # there's only allowed to be one reduceop
-    reduceops = [x for x in self.ast.get_lazyops() if x.op in ReduceOps]
-    assert len(dedup(reduceops)) <= 1, "max one reduce op in an ast"
-    self.reduceop = reduceops[0] if reduceops else None
-
-    # get earlybufs, before the one reduce op
-    self.earlybufs = dedup(self.reduceop.buffers) if self.reduceop else []
-
-    # create new shapetrackers inside this kernel, we will permute them
-    self.sts: List[ShapeTracker] = [x.st.copy() for x in self.bufs]
-    for st in self.sts: st.simplify()
-
-    # make the output buffer shape correct in here
-    self.sts[0].reshape(self.info.shape)
-    self.full_buf_index: int = self.bufs.index(self.earlybufs[0]) if len(self.earlybufs) > 0 else 0
-
-    # move all reduce axes to the end
-    reduce = list(enumerate(zip(self.full_shape, self.sts[0].shape)))
-    permute = tuple([i for i,(s,n) in reduce if s == n] + [i for i,(s,n) in reduce if s != n])
-    self.reshape_and_permute(None, permute)
-
-    # parameters
-    self.group_for_reduce: List[int] = []
-    self.upcasted: int = 0
-    self.local_dims: int = 0
-    self.local_alias: Dict[int, LocalBuffer] = {}
-    self.use_tensor_cores: bool = False
-    self.exclude_local_upcast: int = 0
-
-    # group simplifies
-    self.simplify_ones()
-    self.simplify_merge_adjacent()
-
-    # print early
-    if DEBUG >= 5: self.printbufs("early")
-
-  def shape_offsets(self, i): return itertools.product(*[list(range(s)) for s in self.sts[i].shape[self.shape_len-self.upcasted:][::-1]]) if self.upcasted > 0 else [tuple()]
-  def float4_axis(self, i): return [x-(self.shape_len-self.upcasted) for x in self.sts[i].unit_stride_axes() if x >= self.shape_len-self.upcasted and self.sts[i].shape[x]%4 == 0]
-
-  def upcasted_axis(self, i):
-    return list(zip(self.sts[i].shape[self.shape_len-self.upcasted:],
-                    self.sts[i].real_strides()[self.shape_len-self.upcasted:],
-                    [x!=y for x,y in zip(self.sts[0].shape[self.shape_len-self.upcasted:], self.full_shape[self.shape_len-self.upcasted:])]))
-
-  # TODO: is there a better way to write this?
-  def acc_offsets(self, i):
-    if self.upcasted == 0: return [0]
-    upcasted_i = self.upcasted_axis(i)
-    acc_strides = [x*(1-upcasted_i[::-1][i][2]) for i,x in enumerate(strides_for_shape(tuple(1 if r else s for s,_,r in upcasted_i[::-1])))]
-    return [sum(t) for t in itertools.product(*[[y*acc_strides[i] for y in range(x[0])] for i,x in enumerate(upcasted_i[::-1])])]
-
-  def get_upcast_dim(self, i) -> List[int]:
-    should_upcast = self.opts.supports_float4 and (self.bufs[i].dtype in [dtypes.float32, dtypes.float16] or isinstance(self.bufs[i].dtype, ImageDType))
-    return [x for x in self.sts[i].unit_stride_axes() if should_upcast and x >= self.shape_len-self.upcasted and self.sts[i].shape[x] > 1]
-
-  def global_load(self, i:int, idxs:Sequence[VariableOrNum], const=None) -> List[Token]:
-    if isinstance(self.bufs[i].realized, RawConst): const = self.bufs[i].realized._buf
+  def global_load(self, i:int, idxs:Sequence[VariableOrNum], acc=None) -> List[Token]:
+    const = self.bufs[i].realized._buf if isinstance(self.bufs[i].realized, RawConst) else acc
 
     expanded_nodes = [expand_node(idx) for idx in idxs]
     _idxs = [x[::-1] for x in itertools.product(*expanded_nodes[::-1])]
@@ -236,10 +152,9 @@ class Linearizer:
     if len(upcast_dim) == 1 and len(expanded_nodes[upcast_dim[0]]) in [4,2]:
       dim, amt = upcast_dim[0], len(expanded_nodes[upcast_dim[0]])
 
-    cache: Dict[str, Token] = {}
     ret = []
     invalid_value = 0 if dtypes.is_int(self.bufs[i].dtype) else 0.0
-    for _idx in _idxs:
+    for load_i, _idx in enumerate(_idxs):
       if amt > 1:
         idx, valid = self.sts[i].expr_idxs((_idx[:dim] + (expanded_nodes[dim][0],) + _idx[dim+1:]))
         localtype = dtypes._float4 if amt == 4 else dtypes._float2
@@ -249,12 +164,13 @@ class Linearizer:
       else:
         idx, valid = self.sts[i].expr_idxs(_idx)
         localtype = dtypes.float32
-      this_const, valid, key = (invalid_value, cast(Variable, Variable.num(1)), f"{localtype}INVALID") if valid.max == 0 else (const, valid, f"{localtype}{idx.render()}{valid.render()}")
-      if key not in cache:
+      this_const, idx, valid = (invalid_value, Variable.num(0), Variable.num(1)) if valid.max == 0 else (const, idx, valid)
+      key = f"{acc}{localtype}{this_const if this_const is not None and acc is None else self.get_buffer_name(i)}{idx.render()}{valid.render()}"
+      if key not in self.load_cache:
         if isinstance(self.bufs[i].dtype, ImageDType): idx = to_image_idx(self.bufs[i].dtype.shape, idx, valid)
-        cache[key] = self.uop(UOps.LOAD, Token(f"val{mnum(i)}_{len(cache)}", localtype), [], MemOp(self.get_buffer_name(i), idx, self.bufs[i].__class__ is LocalBuffer, self.bufs[i].dtype, valid, invalid_value)) if this_const is None else \
-                     self.uop(UOps.LOAD, Token(f"acc{mnum(i)}_{len(cache)}", localtype), [], ConstOp(this_const, valid))
-      ret.append(Token(cache[key].name, cache[key].dtype, expanded_nodes[dim].index(_idx[dim])) if localtype != dtypes.float else cache[key])
+        self.load_cache[key] = self.uop(UOps.LOAD, Token(f"val{mnum(i)}_{load_i}", localtype), [], MemOp(self.get_buffer_name(i), idx, self.bufs[i].__class__ is LocalBuffer, self.bufs[i].dtype, valid, invalid_value)) if this_const is None else \
+                               self.uop(UOps.LOAD, Token(f"{'const' if acc is None else 'acc'}{mnum(i)}_{load_i}", localtype), [], ConstOp(this_const, valid))
+      ret.append(Token(self.load_cache[key].name, self.load_cache[key].dtype, expanded_nodes[dim].index(_idx[dim])) if localtype != dtypes.float else self.load_cache[key])
     return ret
 
   def global_store(self, i, idxs:List[VariableOrNum], store:List[Token], ssa) -> None:
@@ -296,14 +212,18 @@ class Linearizer:
 
     # uops
     self.uops: List[UOp] = []
-    self.saved_exprs: Dict[LazyOp, List[Token]] = dict()
+    self.load_cache: Dict[str, Token] = {}
+    self.saved_exprs: Dict[Tuple[Op, Tuple[Token, ...]], Token] = dict()
 
     # add global buffers
     for buf,name in self.arg_bufs.items():
       self.uop(UOps.DEFINE_GLOBAL, None, [], (name, buf.dtype))
+    # add variables from symbolic shapes
+    for var in sorted(set(v for buf in self.ast.buffers for v in buf.st.var_vals), key=lambda k: k.key):
+      self.uop(UOps.DEFINE_GLOBAL, None, [], (var.expr, dtypes._arg_int32))
 
     # add a local buffer for multistage reduce
-    if len(self.group_for_reduce):
+    if self.group_for_reduce:
       # TODO: the strides of this can be controlled
       self.sts.append(ShapeTracker(tuple([1] * self.first_reduce + self.group_for_reduce + [1] * (self.shape_len - self.upcasted - len(self.group_for_reduce) - self.first_reduce) + [x[0] for x in self.upcasted_axis(0)])))
       self.bufs.append(LocalBuffer("temp", self.sts[-1].size()))
@@ -317,7 +237,7 @@ class Linearizer:
     if DEBUG >= 3: self.printbufs()
 
     # kernel name (before late upcast)
-    self.function_name = ("r_" if self.reduceop else "E_") + '_'.join([str(x) for x in self.full_shape])
+    self.function_name = ("r_" if self.reduceop else "E_") + '_'.join([str(x) if isinstance(x, int) else sym_rename(x) for x in self.full_shape])
     self.display_name = ("r_" if self.reduceop else "E_") + colored('_', 'BLACK').join([colored(str(x), c) for x,c in zip(self.full_shape, self.colors())])
 
     # parse AST
@@ -364,39 +284,47 @@ class Linearizer:
         strides = self.sts[i].real_strides()
         extra_locals = [lidx for lidx,st in zip(local_idxs[self.exclude_local_upcast:], strides[len(global_idxs)+self.exclude_local_upcast:self.first_reduce]) if st == 0]
         this_upcast_idxs: List[Node] = []
-        for j,v in enumerate(full_upcast_idxs):
+        # TODO: just flipping the order here is likely not generic at all
+        for j,v in list(enumerate(full_upcast_idxs))[::-1] if self.reverse_upcast_dir else list(enumerate(full_upcast_idxs)):
           if strides[len(global_idxs)+len(local_idxs)+len(reduce_idxs)+j] == 0:
-            if DEBUG >= 4: print("upcasting stride 0")
+            if DEBUG >= 4: print(f"upcasting@{j} stride 0")
             this_upcast_idxs.append(Variable.num(0))
           elif (elc:=[el for el in extra_locals if v.min == el.min and v.max == el.max]):
-            if DEBUG >= 4: print(f"upcasting matched stride {elc[0]}")
+            if DEBUG >= 4: print(f"upcasting@{j} matched stride {elc[0]}")
             this_upcast_idxs.append(elc[0])
             extra_locals.remove(elc[0])
           elif (elc:=[el for el in extra_locals if v.min == el.min and (v.max+1)%(el.max+1) == 0]):
             tacc = Variable.num(0)
             rem = v.max+1
             while len(elc) and rem%(elc[0].max+1) == 0:
-              if DEBUG >= 4: print(f"upcasting partial stride {rem} {elc[0]} left: {elc[1:]}")
+              if DEBUG >= 4: print(f"upcasting@{j} partial stride {rem} {elc[0]} left: {elc[1:]}")
               rem = rem//(elc[0].max+1)
               tacc += (elc[0] * rem)
               extra_locals.remove(elc[0])
               elc = [el for el in extra_locals if v.min == el.min and rem%(el.max+1) == 0]
-            if DEBUG >= 4 and rem > 1: print(f"failed upcasting partial stride {rem} extra locals {extra_locals}")
+            if DEBUG >= 4 and rem > 1: print(f"failed upcasting@{j} partial stride {rem} extra locals {extra_locals}")
             this_upcast_idxs.append(tacc + Variable(None, 0, rem-1))
           else:
-            if DEBUG >= 4: print(f"failed upcasting stride {v} extra locals {extra_locals}")
+            if DEBUG >= 4: print(f"failed upcasting@{j} stride {v} extra locals {extra_locals}")
             this_upcast_idxs.append(v)
-        idxs = global_idxs+local_idxs+reduce_idxs+this_upcast_idxs
+        idxs = global_idxs+local_idxs+reduce_idxs+(this_upcast_idxs[::-1] if self.reverse_upcast_dir else this_upcast_idxs)
         ll = self.global_load(i, idxs)
         locals_to_store.append((self.bufs.index(self.local_alias[i]), idxs, ll))
 
       # copy in any global buffers
       if self.use_tensor_cores:
-        i = 0
-        for y0,y1 in zip(locals_to_store[1][2][::2], locals_to_store[1][2][1::2]):
-          for x0,x1 in zip(locals_to_store[0][2][::2], locals_to_store[0][2][1::2]):
-            self.uop(UOps.WMMA, None, [x0, x1, y0, y1, acc[i], acc[i+1]], ())
-            i += 2
+        if self.bufs[0].device == "METAL":
+          i = 0
+          for y0,y1 in zip(locals_to_store[1][2][::2], locals_to_store[1][2][1::2]):
+            for x0,x1 in zip(locals_to_store[0][2][::2], locals_to_store[0][2][1::2]):
+              self.uop(UOps.WMMA, None, [x0, x1, y0, y1, acc[i], acc[i+1]], "METAL")
+              i += 2
+        elif self.bufs[0].device == "HIP":
+          i = 0
+          for y in range(0, len(locals_to_store[1][2]), 0x10):
+            for x in range(0, len(locals_to_store[0][2]), 0x10):
+              self.uop(UOps.WMMA, None, acc[i:i+8]+locals_to_store[0][2][x:x+0x10]+locals_to_store[1][2][y:y+0x10], "HIP")
+              i += 8
       else:
         if locals_to_store:
           self.uop(UOps.BARRIER, None, [], ())
@@ -404,13 +332,14 @@ class Linearizer:
           self.uop(UOps.BARRIER, None, [], ())
 
         # load earlybufs
-        loaded_buffers.update({b:self.global_load(self.bufs.index(self.local_alias[i]) if i in self.local_alias else i, global_idxs+local_idxs+reduce_idxs+full_upcast_idxs) for i,b in enumerate(self.bufs) if b in self.earlybufs and i != 0})
+        loaded_buffers.update({b:self.global_load(self.bufs.index(self.local_alias[i]) if i in self.local_alias else i, global_idxs+local_idxs+reduce_idxs+full_upcast_idxs) for i,b in enumerate(self.bufs[1:], start=1) if b in self.earlybufs})
 
         # run early AST (with reduce)
         self.ast_parse(self.reduceop, [acc[off] for off in self.acc_offsets(self.full_buf_index)], loaded_buffers, ssa, do_reduce=True)
 
       # end the reduce loop
       self.uop(UOps.ENDLOOP, None, [], (reduce_idxs, "reduce"))
+      self.load_cache.clear()
 
       # end the local loop, do the local reduce
       if self.group_for_reduce:
@@ -448,6 +377,7 @@ class Linearizer:
 
         # end the late reduce loop
         self.uop(UOps.ENDLOOP, None, [], (end_local_idxs, "late_reduce"))
+        self.load_cache.clear()
 
     # load latebufs
     loaded_buffers.update({b:self.global_load(i, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs) for i,b in enumerate(self.bufs) if b not in self.earlybufs and i != 0 and b.__class__ is not LocalBuffer})
@@ -477,6 +407,11 @@ class Linearizer:
     if DEBUG >= 4: print(self.uops[-1])
     return out
 
+  def uop_alu(self, out: Token, vin: List[Token], op: Op) -> Token:
+    key = (op, tuple(vin))
+    if key not in self.saved_exprs: self.saved_exprs[key] = self.uop(UOps.ALU, out, vin, op)
+    return self.saved_exprs[key]
+
   def ast_parse(self, x, acc, loaded_buffers, ssa, do_reduce=False) -> List[Token]:
     if x.__class__ is not LazyOp: return loaded_buffers[x]
     if x.op in [UnaryOps.NOOP, UnaryOps.CAST]: return self.ast_parse(x.src[0], acc, loaded_buffers, ssa)  # cast isn't an ALU op
@@ -490,178 +425,16 @@ class Linearizer:
       # Reorder sources to put constants first so get_grouped_maybe_float4 can fold the op
       srcs = sorted(x.src, key=lambda x: (x.realized.__class__ != RawConst) if x.__class__ == LazyBuffer else 0)
       x.src = tuple(srcs)
-    if x not in self.saved_exprs:
-      values = [self.ast_parse(v, acc, loaded_buffers, ssa) for v in x.src]
-      ops = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX, TernaryOps.MULACC:TernaryOps.MULACC}
-      if x.op in ops:
-        ret = [(idx, self.uop(UOps.ALU, val[-1], list(val), ops[x.op])) for idx, val in get_grouped_maybe_float4(*values, acc, grouping_allowed=self.opts.supports_float4_alu)]
-      else:
-        ret = [(idx, self.uop(UOps.ALU, ssa('alu', dtypes._float4) if any(x.dtype == dtypes._float4 and x.offset is None for x in val) else ssa('alu'), list(val), x.op)) for idx, val in get_grouped_maybe_float4(*values, grouping_allowed=self.opts.supports_float4_alu and x.op not in {BinaryOps.CMPLT, TernaryOps.WHERE})]
-      ordered_ret: List[Optional[Token]] = [None]*len(values[0])
-      # scatter
-      for i,j in ret:
-        for o,k in enumerate(i):
-          ordered_ret[k] = Token(j.name, j.dtype, o) if j.dtype == dtypes._float4 else j
-      assert all(isinstance(x, Token) for x in ordered_ret), "some tokens didn't get scattered?"
-      self.saved_exprs[x] = cast(List[Token], ordered_ret)
-    return self.saved_exprs[x]
-
-  @property
-  def first_reduce(self) -> int: return [x!=y for x,y in zip(self.sts[0].shape[:self.shape_len-self.upcasted]+(0,), self.full_shape[:self.shape_len-self.upcasted]+(1,))].index(True)
-
-  @property
-  def output_shape(self) -> Tuple[int, ...]: return self.sts[0].shape
-
-  @property
-  def full_shape(self) -> Tuple[int, ...]: return self.sts[self.full_buf_index].shape
-
-  @property
-  def full_unupcasted_shape(self) -> Tuple[int, ...]: return self.full_shape[:self.shape_len-self.upcasted]
-
-  @property
-  def shape_len(self) -> int: return len(self.sts[0].shape)
-
-  @property
-  def upcast_in_mid_reduce_axes(self) -> List[int]: return [j for j in range(self.first_reduce, self.first_reduce+len(self.group_for_reduce)) if self.full_shape[j] == self.sts[0].shape[j]]
-
-  # there's seven chunks of the shape
-  # blue   -- global dims
-  # cyan   -- local dims
-  #  *** self.first_reduce
-  # green  -- reduce-local dims
-  # white  -- reduce-late upcasted dim (self.upcast_in_mid_reduce_axes)
-  # red    -- reduce loops
-  #  *** self.upcasted
-  # purple -- reduce upcasted
-  # yellow -- normal upcasted dimensions
-  def colors(self) -> List[str]:
-    # up to first_reduce, they are all global (blue)
-    colors = ["blue"] * (self.first_reduce-self.local_dims)
-    # except the local_dims, these are non-reduce locals (cyan)
-    colors += ["cyan"] * (self.local_dims)
-    # between first_reduce and first_reduce + group_for_reduce, they are either local (cyan), or late upcasted (green)
-    colors += ["white" if i in self.upcast_in_mid_reduce_axes else "green" for i in range(self.first_reduce, self.first_reduce + len(self.group_for_reduce))]
-    # between first_reduce + group_for_reduce and upcasted, they are reduce (red)
-    colors += ["red"] * ((self.shape_len-self.upcasted) - (self.first_reduce + len(self.group_for_reduce)))
-    # upcasted dimensions are reduce (magenta) or normal (yellow)
-    colors += ["magenta" if self.full_shape[i] != self.sts[0].shape[i] else "yellow" for i in range(self.shape_len-self.upcasted, self.shape_len)]
-    assert len(colors) == self.shape_len, "colors size mismatch"
-    return colors
-
-  def colored_shape(self) -> str: return ' '.join(colored(f"{s:4d}", color) for s,color in zip(self.full_shape, self.colors()))
-  def printbufs(self, prefix=""):
-    for i in range(len(self.sts)):
-      print(prefix, f"{i:3d} {str(self.bufs[i].realized) if self.bufs[i].realized is not None else str(self.bufs[i]):47s}", self.sts[i].views)
-    print(self.colored_shape())
-
-  # ******************** base simplifiers ********************
-
-  # apply reshape and permute to all shapetrackers
-  def reshape_and_permute(self, new_shape_fxn, axis):
-    for st in self.sts:
-      if new_shape_fxn is not None: st.reshape(tuple(new_shape_fxn(st.shape)))
-      if axis is not None: st.permute(tuple(axis))
-
-  # drops the final dimension
-  def upcast(self):
-    assert self.full_shape[-1] != 1, "can't upcast a dimension with size 1"
-    self.upcasted += 1
-
-  # axis : the axis to pull from
-  # amount : the amount to take
-  # top : if you want to pull that amount from the top
-  # insert_before : place to insert the new stuff
-  def shift_to(self, axis, amount, top=False, insert_before=None):
-    if insert_before is None: insert_before = self.shape_len
-    move_axis = axis if top else axis+1
-    if move_axis < insert_before: insert_before += 1
-    self.reshape_and_permute(
-      lambda x: list(x[0:axis]) + (([amount, x[axis]//amount] if top else [x[axis]//amount, amount]) if x[axis] > 1 else [1,1]) + list(x[axis+1:]),
-      [i for i in range(insert_before) if i != move_axis] + [move_axis] + [i for i in range(insert_before, self.shape_len+1) if i != move_axis])
-
-  # ******************** complex simplifiers ********************
-
-  def simplify_ones(self):
-    # remove places where the shape is all ones
-    # TODO: this should be factored in to multi shape stride
-    if self.shape_len == 0: return
-    all_ones = [s==1 for s in self.full_shape]
-    self.local_dims -= sum(all_ones[self.first_reduce-self.local_dims:self.first_reduce])
-    self.upcasted -= sum(all_ones[self.shape_len-self.upcasted:])
-    self.reshape_and_permute(lambda shape: [x for i,x in enumerate(shape) if not all_ones[i]], None)
-
-  def simplify_merge_adjacent(self):
-    if self.shape_len == 0: return
-    shapes, strides = [x.shape for x in self.sts], [x.real_strides() for x in self.sts]
-
-    # merge dimensions if we can, multi get_shape_strides
-    # TODO: does this always preserve the reduce dimension, NO
-    # TODO: move this into shapetracker, with tests!
-    rets = [[(shapes[j][0], strides[j][0])] for j in range(len(shapes))]
-    for i in range(1, len(shapes[0])):
-      can_merge = []
-      for j in range(len(shapes)):
-        # TODO: added the always mergeability of 1s, is this right? if so, add to shapetracker in the 1 case
-        can_merge.append(strides[j][i] is not None and ((strides[j][i] != 0 and rets[j][-1][1] == shapes[j][i]*cast(int, strides[j][i])) or (strides[j][i] == 0 and rets[j][-1][1] == 0)))
-      # more can merge than this
-      mergeable = all(can_merge) and i != self.first_reduce
-      for j in range(len(shapes)):
-        if mergeable: rets[j][-1] = (rets[j][-1][0] * shapes[j][i], strides[j][i])
-        else: rets[j].append((shapes[j][i], strides[j][i]))
-
-    # do the reshapes
-    for i,x in enumerate(rets): self.sts[i].reshape(tuple([y[0] for y in x]))
-
-  # ******************** GPU simplifiers ********************
-  def _limit_size(self, x: Tuple[int], max_size: List) -> Tuple[int, ...]:
-    new_shape,dims = list(x), len(x)
-    for i in range(dims):
-      next_idx = (i + 1) % dims
-      while new_shape[i] > max_size[i]:
-        new_shape[i] = new_shape[i] // 2
-        if (new_shape[next_idx] <= max_size[next_idx]):
-          new_shape[next_idx] = new_shape[next_idx] * 2
-        else:
-          next_idx = (next_idx + 1) % dims
-          new_shape[next_idx] = new_shape[next_idx] * 2
-    return tuple(new_shape)
-
-  def limit_global_dims(self, limit: int, global_max: List[int], local_max: List[int]):
-    # sometimes, there's more dimensions than len(self.lang.gid).
-    # compact all the dimensions into the first
-    # NOTE: this might make multiview shapetrackers
-    if (self.first_reduce-self.local_dims) > limit:
-      num_to_merge = ((self.first_reduce-self.local_dims) - limit)+1
-      self.reshape_and_permute(lambda x: (prod(x[0:num_to_merge]),)+x[num_to_merge:], None)
-      if DEBUG >= 3: print("reshaped to", self.full_shape, "due to too many global dimensions")
-    # Check the global allocation limit, current the global_size will be flipped during codegen
-    # and then padded right with 1s if its length < 3 which makes this part a bit awkward to write
-    global_dims = self.first_reduce-self.local_dims
-    if global_dims > 0:
-      if global_max:
-        tmp = global_max[:global_dims] + (local_max[:self.local_dims] if local_max else [])
-        if max(global_max) < max(self.full_shape[:global_dims]): self.reshape_and_permute(lambda x: self._limit_size(x, tmp + [math.inf] * (len(self.full_shape)-len(tmp))), None)
-        assert max(global_max) >= max(self.full_shape[:global_dims]), f"device max allocation {max(self.full_shape[:global_dims])} exceeds global dim maximum {max(global_max)}"
-      for i in range(global_dims-1):
-        if self.full_shape[i] > global_max[i]:
-          order = list(range(len(self.full_shape)))
-          order[i], order[global_dims-1] = order[global_dims-1], order[i]
-          self.reshape_and_permute(None, order)
-          if DEBUG >= 3: print("permuted global dim", order, "due to allocation exceeds global limit")
-
-  def alias_buffer(self, i, pattern):
-    assert len(pattern) == len(self.sts[i].shape), f"must include a pattern for each shape {pattern} {self.sts[i].shape}"
-
-    bst = 1
-    real_strides = self.sts[i].real_strides()
-    shp, stride = [(s if p != 0 else 1) for s,p in zip(self.sts[i].shape, pattern)], [0]*len(pattern)
-    for priority in range(1, max(pattern)+1):  # priority. 0 is non local and ignored
-      for j,p in enumerate(pattern):
-        if priority == p and real_strides[j] != 0:
-          stride[j] = bst
-          bst *= shp[j]
-
-    self.sts.append(ShapeTracker(tuple(shp), [View(tuple(shp), tuple(stride))]))
-    self.bufs.append(LocalBuffer(name=f"ldata{i}", size=self.sts[-1].size()))
-    if DEBUG >= 4: print("aliasing buffer", self.sts[i])
-    self.local_alias[i] = self.bufs[-1]
+    values = [self.ast_parse(v, acc, loaded_buffers, ssa) for v in x.src]
+    ops = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX, TernaryOps.MULACC:TernaryOps.MULACC}
+    if x.op in ops:
+      ret = [(idx, self.uop(UOps.ALU, val[-1], list(val), ops[x.op])) for idx, val in get_grouped_maybe_float4(*values, acc, grouping_allowed=self.opts.supports_float4_alu)]
+    else:
+      ret = [(idx, self.uop_alu(ssa('alu', dtypes._float4) if any(x.dtype == dtypes._float4 and x.offset is None for x in val) else ssa('alu'), list(val), x.op)) for idx, val in get_grouped_maybe_float4(*values, grouping_allowed=self.opts.supports_float4_alu and x.op not in {BinaryOps.CMPLT, TernaryOps.WHERE})]
+    ordered_ret: List[Optional[Token]] = [None]*len(values[0])
+    # scatter
+    for i,j in ret:
+      for o,k in enumerate(i):
+        ordered_ret[k] = Token(j.name, j.dtype, o) if j.dtype == dtypes._float4 else j
+    assert all(isinstance(x, Token) for x in ordered_ret), "some tokens didn't get scattered?"
+    return cast(List[Token], ordered_ret)

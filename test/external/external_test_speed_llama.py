@@ -4,14 +4,14 @@ import numpy as np
 from examples.llama import Transformer, MODEL_PARAMS
 from test.test_net_speed import start_profile, stop_profile
 from tinygrad.tensor import Tensor
-from tinygrad.lazy import Device
-from tinygrad.state import get_state_dict
+from tinygrad.ops import Device
+from tinygrad.nn.state import get_state_dict
 from tinygrad.ops import Compiled
 from tinygrad.helpers import dtypes, prod
 from tinygrad.runtime.lib import RawBuffer
 
 class FakeProgram:
-  def __init__(self, name:str, prg:str): pass
+  def __init__(self, name:str, prg:str, binary:bool): pass
   def __call__(self, global_size, local_size, *bufs, wait=False): pass
 
 class RawFakeBuffer(RawBuffer):

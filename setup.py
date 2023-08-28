@@ -8,7 +8,7 @@ with open(os.path.join(directory, 'README.md'), encoding='utf-8') as f:
   long_description = f.read()
 
 setup(name='tinygrad',
-      version='0.6.0',
+      version='0.7.0',
       description='You like pytorch? You like micrograd? You love tinygrad! <3',
       author='George Hotz',
       license='MIT',
@@ -24,6 +24,7 @@ setup(name='tinygrad',
       extras_require={
         'llvm': ["llvmlite"],
         'cuda': ["pycuda"],
+        'arm': ["unicorn"],
         'triton': ["triton>=2.0.0.dev20221202"],
         'webgpu': ["wgpu"],
         'metal': ["pyobjc-framework-Metal", "pyobjc-framework-Cocoa", "pyobjc-framework-libdispatch"],

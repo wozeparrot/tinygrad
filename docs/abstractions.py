@@ -22,7 +22,7 @@ from abc import ABC
 # let's trace an addition down through the layers of abstraction.
 
 # we will be using the clang backend
-from tinygrad.lazy import Device
+from tinygrad.ops import Device
 Device.DEFAULT = "CLANG"
 
 # first, 2+3 as a Tensor, the highest level
@@ -307,7 +307,7 @@ GlobalCounters.cache = None  # disable the cache
 
 # there's one ASTRunner in the cache
 assert len(cache_saved) == 1
-prg, bufs = cache_saved[0]
+prg, bufs, _ = cache_saved[0]
 
 # print the C Program :)
 print(prg.prg)
