@@ -14,8 +14,8 @@ cir = {v[0]: int(k) for k,v in ci.items()}
 
 @functools.lru_cache(None)
 def get_train_files():
-  train_files = open(BASEDIR / "train_files").read().strip().split("\n")
-  return [(BASEDIR / "train" / x) for x in train_files]
+  train_files = glob.glob(str(BASEDIR / "train/*/*"))
+  return train_files
 
 @functools.lru_cache(None)
 def get_val_files():
@@ -70,7 +70,7 @@ def random_resized_crop(img, size, scale=(0.08, 1.0), ratio=(3/4, 4/3)):
         img = img.crop((crop_left, crop_top, crop_left + w_new, crop_top + h_new))
         random_solution_found = True
         break
-    
+
   # Center crop
   if not random_solution_found:
     in_ratio = float(w) / float(h)
@@ -114,7 +114,7 @@ def iterate(bs=32, val=True, shuffle=True, num_workers=0):
   if shuffle: random.shuffle(order)
   if num_workers > 0:
     from multiprocessing import Pool
-    p = Pool(16)
+    p = Pool(num_workers)
   for i in range(0, len(files), bs)[:-1]:  # Don't get last batch so all batch shapes are consistent
     st = time.monotonic()
     if num_workers > 0:
