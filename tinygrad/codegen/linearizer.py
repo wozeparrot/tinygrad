@@ -224,7 +224,7 @@ class Linearizer(OptimizedKernel):
 
     # define indexes
     global_idxs, loop_global_idxs = get_grouped_dims("gidx", 0, self.full_shape[:self.global_dims], 3 if self.opts.has_local else 0)
-    local_idxs, loop_local_idxs = get_grouped_dims("lidx", self.global_dims+1, self.full_shape[self.global_dims:self.first_reduce+len(self.group_for_reduce)], (2 if self.tensor_core else 3) if self.opts.has_local else 0)
+    local_idxs, loop_local_idxs = get_grouped_dims("lidx", self.global_dims+(1 if self.tensor_core else 0), self.full_shape[self.global_dims:self.first_reduce+len(self.group_for_reduce)], (2 if self.tensor_core else 3) if self.opts.has_local else 0)
     full_upcast_idxs = [Variable(None, 0, s-1) for s in self.full_shape[self.shape_len-self.upcasted+(3 if self.tensor_core else 0):]]
     upcast_idxs = [Variable(None, 0, s-1) for s in self.output_shape[self.shape_len-self.upcasted+(3 if self.tensor_core else 0):]]
     warp_idxs, aliased_wmma_idxs = [], []
@@ -346,6 +346,7 @@ class Linearizer(OptimizedKernel):
         # end the late reduce loop
         end_loop(end_local_idxs)
         self.load_cache.clear()
+        acc_idxs = global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs
 
     # load latebufs
     loaded_buffers.update({b:self.global_load(i, acc_idxs) for i,b in enumerate(self.bufs) if b not in self.earlybufs and i != 0 and b.__class__ is not LocalBuffer})
