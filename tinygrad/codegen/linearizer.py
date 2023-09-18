@@ -299,7 +299,7 @@ class Linearizer(OptimizedKernel):
         acc_reds = (len(wmma_vals[1])//wmma_sz[1])//(len(acc)//wmma_sz[2])
         for i in range(len(acc)//wmma_sz[2]):
           for j in range(acc_reds):
-              self.uop(UOps.WMMA, None, wmma_vals[0][(i*acc_reds+j)*wmma_sz[0]:(i*acc_reds+j+1)*wmma_sz[0]] + wmma_vals[1][(i*acc_reds+j)*wmma_sz[1]:(i*acc_reds+j+1)*wmma_sz[1]] + acc[i*wmma_sz[2]:(i+1)*wmma_sz[2]], self.bufs[0].device)
+            self.uop(UOps.WMMA, None, tuple(wmma_vals[0][(i*acc_reds+j)*wmma_sz[0]:(i*acc_reds+j+1)*wmma_sz[0]] + wmma_vals[1][(i*acc_reds+j)*wmma_sz[1]:(i*acc_reds+j+1)*wmma_sz[1]] + acc[i*wmma_sz[2]:(i+1)*wmma_sz[2]]), self.bufs[0].device)
       else:
         # load earlybufs
         loaded_buffers.update({b:self.global_load(self.bufs.index(self.local_alias[i]) if i in self.local_alias else i, global_idxs+local_idxs+reduce_idxs+full_upcast_idxs) for i,b in enumerate(self.bufs[1:], start=1) if b in self.earlybufs})
