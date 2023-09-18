@@ -180,21 +180,44 @@ class OptimizedKernel(Kernel):
         buf0_strides, buf1_strides = self.sts[buf0].real_strides(), self.sts[buf1].real_strides()
         axis_buf0 = [(i,self.full_shape[i],buf1_strides[i]) for i,s in enumerate(buf0_strides) if s == 0 and self.full_shape[i]%tc.dims[0] == 0 and i < self.first_reduce]
         axis_buf1 = [(i,self.full_shape[i],buf0_strides[i]) for i,s in enumerate(buf1_strides) if s == 0 and self.full_shape[i]%tc.dims[1] == 0 and i < self.first_reduce]
-        if not(axis_buf0 and axis_buf1 and self.full_shape[self.first_reduce]%tc.dims[2] == 0 and self.full_shape[self.first_reduce] > tc.dims[2] and (self.shape_len-self.first_reduce) == 1):
+        optim_conv2d = (self.shape_len-self.first_reduce) == 3 and self.full_shape[self.first_reduce+1]%2 == 1 and self.full_shape[self.first_reduce+2]%2 == 1 and max(self.full_shape[self.first_reduce+1:self.first_reduce+3]) < 21
+        if not(axis_buf0 and axis_buf1 and self.full_shape[self.first_reduce]%tc.dims[2] == 0 and self.full_shape[self.first_reduce] > tc.dims[2] and \
+               ((self.shape_len-self.first_reduce) == 1 or optim_conv2d)):
           continue
         if DEBUG >= 3: print("TENSOR CORES", axis_buf0, axis_buf1, tc)
         self.tensor_core = tc
         s0, s1 = axis_buf0[-1][0], axis_buf1[-1][0] # TODO: select axis in smart way
-        self.shift_to(self.first_reduce, tc.dims[2])
-        self.shift_to(s0, tc.dims[0])
-        self.shift_to(s1, tc.dims[1])
-        self.upcasted += 3
-        for ax in [s1, s0]:
-          for upc in [4,3,2]:
-            if self.full_shape[ax]%upc == 0:
-              self.shift_to(ax, upc)
-              self.upcast()
-              break
+        global_count = self.first_reduce
+        if optim_conv2d:
+          self.upcast()
+          self.shift_to(self.first_reduce, tc.dims[2], insert_before=self.shape_len-1)
+          self.shift_to(s0, tc.dims[0], insert_before=self.shape_len-1)
+          self.shift_to(s1, tc.dims[1], insert_before=self.shape_len-1)
+          self.upcasted += 3
+          if max(self.full_shape[self.first_reduce+1:self.first_reduce+3]) < 5:
+            self.upcast()
+            for upc in range(8, 1, -1):
+              if self.full_shape[global_count-2]%upc == 0:
+                self.shift_to(global_count-2, upc)
+                self.upcast()
+                break
+          else:
+            for upc in range(16, 1, -1):
+              if self.full_shape[global_count-1]%upc == 0:
+                self.shift_to(global_count-1, upc)
+                self.upcast()
+                break
+        else:
+          self.shift_to(self.first_reduce, tc.dims[2])
+          self.shift_to(s0, tc.dims[0])
+          self.shift_to(s1, tc.dims[1])
+          self.upcasted += 3
+          for ax in [s1, s0]:
+            for upc in [4,3,2]:
+              if self.full_shape[ax]%upc == 0:
+                self.shift_to(ax, upc)
+                self.upcast()
+                break
         # TODO: decouple this from future local shared memory buffers
         self.alias_buffer(buf0, [0]*(self.shape_len-self.upcasted) + [1]*3 + [0]*(self.upcasted-3))
         self.alias_buffer(buf1, [0]*(self.shape_len-self.upcasted) + [1]*3 + [0]*(self.upcasted-3))
