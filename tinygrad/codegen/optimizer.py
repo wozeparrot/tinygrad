@@ -196,8 +196,8 @@ class OptimizedKernel(Kernel):
               self.upcast()
               break
         # TODO: decouple this from future local shared memory buffers
-        self.alias_buffer(buf0, [0]*(self.first_reduce+1) + [1]*3 + [0]*(self.upcasted-3))
-        self.alias_buffer(buf1, [0]*(self.first_reduce+1) + [1]*3 + [0]*(self.upcasted-3))
+        self.alias_buffer(buf0, [0]*(self.shape_len-self.upcasted) + [1]*3 + [0]*(self.upcasted-3))
+        self.alias_buffer(buf1, [0]*(self.shape_len-self.upcasted) + [1]*3 + [0]*(self.upcasted-3))
         return
 
     if self.opts.has_local and all(isinstance(s, int) for s in self.sts[0].shape[:self.first_reduce]):
