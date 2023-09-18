@@ -232,18 +232,18 @@ class Linearizer(OptimizedKernel):
     if self.tensor_core:
       warp_idxs, loop_warp_idxs = get_grouped_dims("lidx", self.global_dims, [prod(self.tensor_core.threads)], 1)
       warp_segment_idxs = []
-      for sz in self.tensor_core.threads:
-        warp_segment_idxs.append(loop_warp_idxs[0] % sz)
-        loop_warp_idxs[0] //= sz
+      for segment_sz in self.tensor_core.threads:
+        warp_segment_idxs.append(loop_warp_idxs[0] % segment_sz)
+        loop_warp_idxs[0] //= segment_sz
       def calc_tc_idxs(local_size: int, aliases: List[List[int]]):
         idxs = []
         for alias in aliases:
-          full_var, sz = Variable.num(0), 1
+          full_var, full_var_sz = Variable.num(0), 1
           if alias[0] != 0:
             for i in alias:
               next_var = warp_segment_idxs[i-1] if i > 0 else Variable(None, 0, local_size-1)
-              full_var += next_var * sz
-              sz *= next_var.max+1
+              full_var += next_var * full_var_sz
+              full_var_sz *= next_var.max+1
           idxs.append(full_var)
         return idxs
       aliased_wmma_idxs = [calc_tc_idxs(x[0], x[1]) for x in zip(self.tensor_core.thread_local_sizes, self.tensor_core.thread_local_aliases)]
@@ -294,9 +294,9 @@ class Linearizer(OptimizedKernel):
         self.uop(UOps.BARRIER, None, ())
 
         # load WMMA input values
-        wmma_vals, sz = [self.global_load(i+1, global_idxs+local_idxs+reduce_idxs+aliased_wmma_idxs[i]+upcast_idxs) for i in range(2)], self.tensor_core.thread_local_sizes
-        for i in range(len(acc)//sz[2]):
-          self.uop(UOps.WMMA, None, tuple(wmma_vals[0][i*sz[0]:(i+1)*sz[0]]+wmma_vals[1][i*sz[1]:(i+1)*sz[1]]+acc[i*sz[2]:(i+1)*sz[2]]), self.bufs[0].device)
+        wmma_vals, wmma_sz = [self.global_load(i+1, global_idxs+local_idxs+reduce_idxs+aliased_wmma_idxs[i]+upcast_idxs) for i in tuple(range(2))], self.tensor_core.thread_local_sizes
+        for i in range(len(acc)//wmma_sz[2]):
+          self.uop(UOps.WMMA, None, tuple(wmma_vals[0][i*wmma_sz[0]:(i+1)*wmma_sz[0]]+wmma_vals[1][i*wmma_sz[1]:(i+1)*wmma_sz[1]]+acc[i*wmma_sz[2]:(i+1)*wmma_sz[2]]), self.bufs[0].device)
       else:
         # load earlybufs
         loaded_buffers.update({b:self.global_load(self.bufs.index(self.local_alias[i]) if i in self.local_alias else i, global_idxs+local_idxs+reduce_idxs+full_upcast_idxs) for i,b in enumerate(self.bufs[1:], start=1) if b in self.earlybufs})
