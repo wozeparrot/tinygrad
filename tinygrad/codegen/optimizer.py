@@ -181,8 +181,7 @@ class OptimizedKernel(Kernel):
         axis_buf0 = [(i,self.full_shape[i],buf1_strides[i]) for i,s in enumerate(buf0_strides) if s == 0 and self.full_shape[i]%tc.dims[0] == 0 and i < self.first_reduce]
         axis_buf1 = [(i,self.full_shape[i],buf0_strides[i]) for i,s in enumerate(buf1_strides) if s == 0 and self.full_shape[i]%tc.dims[1] == 0 and i < self.first_reduce]
         optim_conv2d = (self.shape_len-self.first_reduce) == 3 and self.full_shape[self.first_reduce+1]%2 == 1 and self.full_shape[self.first_reduce+2]%2 == 1 and max(self.full_shape[self.first_reduce+1:self.first_reduce+3]) < 21
-        if not(axis_buf0 and axis_buf1 and self.full_shape[self.first_reduce]%tc.dims[2] == 0 and self.full_shape[self.first_reduce] > tc.dims[2] and \
-               ((self.shape_len-self.first_reduce) == 1 or optim_conv2d)):
+        if not(axis_buf0 and axis_buf1 and self.full_shape[self.first_reduce]%tc.dims[2] == 0 and self.full_shape[self.first_reduce] > tc.dims[2] and ((self.shape_len-self.first_reduce) == 1 or optim_conv2d)):
           continue
         if DEBUG >= 3: print("TENSOR CORES", axis_buf0, axis_buf1, tc)
         self.tensor_core = tc
