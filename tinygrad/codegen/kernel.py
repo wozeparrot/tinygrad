@@ -8,6 +8,23 @@ from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.symbolic import sint
 from tinygrad.shape.view import strides_for_shape
 
+class TensorCore(NamedTuple):
+  device: str
+  dims: List[int]
+  dtype_in: DType
+  dtype_out: DType
+  threads: List[int]
+  thread_local_aliases: List[List[List[int]]]
+  thread_local_sizes: List[int]
+  arch: Optional[str] = None
+  def __str__(self): return f"tensor_core<{self.device}, {self.dims}, {self.dtype_in}, {self.dtype_out}>"
+
+# TODO(TC): doesn't belong here!!!
+tensor_cores: Dict[str, List[TensorCore]] = {
+  "METAL": [TensorCore(device="METAL", dims=[8,8,8], dtype_in=dtypes.float, dtype_out=dtypes.float, threads=[2,4,2,2], thread_local_sizes=[2,2,2], thread_local_aliases=[ [[-1, 1, 3], [0], [2, 4]], [[2, 4], [-1, 1, 3], [0]], [[0], [-1, 1, 3], [2, 4]] ], arch="arm64")],
+  "HIP": [TensorCore(device="HIP", dims=[16,16,16], dtype_in=dtypes.half, dtype_out=dtypes.float, threads=[16,2], thread_local_sizes=[16,16,8], thread_local_aliases=[ [[-1], [0], [1]], [[-1], [1], [0]], [[0], [1], [2, -1]] ])]
+}
+
 class LocalBuffer(NamedTuple):
   name: str
   size: int
@@ -67,9 +84,7 @@ class Kernel:
     self.upcasted: int = 0
     self.local_dims: int = 0
     self.local_alias: Dict[int, LocalBuffer] = {}
-    self.use_tensor_cores: bool = False
-    self.exclude_local_upcast: int = 0
-    self.reverse_upcast_dir: bool = False
+    self.tensor_core: Optional[TensorCore] = None
 
     self.global_size: Optional[List[int]] = None
     self.local_size: Optional[List[int]] = None
@@ -127,6 +142,7 @@ class Kernel:
   # white  -- reduce-late upcasted dim (self.upcast_in_mid_reduce_axes)
   # red    -- reduce loops
   #  *** self.upcasted
+  # cyan   -- WWMA
   # purple -- reduce upcasted
   # yellow -- normal upcasted dimensions
   def colors(self) -> List[str]:
@@ -139,7 +155,7 @@ class Kernel:
     # between first_reduce + group_for_reduce and upcasted, they are reduce (red)
     colors += ["red"] * ((self.shape_len-self.upcasted) - (self.first_reduce + len(self.group_for_reduce)))
     # upcasted dimensions are reduce (magenta) or normal (yellow)
-    colors += ["magenta" if self.full_shape[i] != self.sts[0].shape[i] else "yellow" for i in range(self.shape_len-self.upcasted, self.shape_len)]
+    colors += ["cyan"] * (3 if self.tensor_core else 0) + ["magenta" if self.full_shape[i] != self.sts[0].shape[i] else "yellow" for i in range(self.shape_len-self.upcasted+(3 if self.tensor_core else 0), self.shape_len)]
     assert len(colors) == self.shape_len, "colors size mismatch"
     return colors
 
