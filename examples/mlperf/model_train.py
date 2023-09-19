@@ -1,3 +1,4 @@
+from extra.helpers import cross_process
 from tinygrad.tensor import Tensor
 from tinygrad.jit import TinyJit
 from tinygrad.nn.state import get_parameters, get_state_dict
@@ -61,7 +62,7 @@ def train_resnet():
     Tensor.default_type = dtypes.float16
   model = ResNet50(num_classes)
   if FP16:
-    for v in get_state_dict(model).values(): v.assign(v.cast(dtypes.float16).realize())
+    for v in get_parameters(model): v.assign(v.cast(dtypes.float16).realize())
   parameters = get_parameters(model)
 
   BS = 32
@@ -76,17 +77,19 @@ def train_resnet():
   for e in range(epochs):
     # train loop
     Tensor.training = True
-    for i, (X, Y, data_time) in enumerate(t := tqdm(iterate(bs=BS, val=False, num_workers=16), total=steps_in_train_epoch)):
+    dt = time.perf_counter()
+    for i, (X, Y, data_time) in enumerate(t := tqdm(cross_process(lambda: iterate(bs=BS, val=False, num_workers=16)), total=steps_in_train_epoch)):
+      dte = time.perf_counter()
       GlobalCounters.reset()
-      st = time.monotonic()
+      st = time.perf_counter()
       if i == 0: Xt, Yt = Tensor(X, requires_grad=False), Tensor(Y, requires_grad=False)
       loss, out = train_step(Xt, Yt)
-      et = time.monotonic()
+      et = time.perf_counter()
       Xt, Yt = Tensor(X, requires_grad=False), Tensor(Y, requires_grad=False)
       loss_cpu = loss.numpy()
-      cl = time.monotonic()
+      cl = time.perf_counter()
 
-      print(f"{(data_time+cl-st)*1000.0:7.2f} ms run, {(et-st)*1000.0:7.2f} ms python, {(cl-et)*1000.0:7.2f} ms CL, {data_time*1000.0:7.2f} ms fetch data, {loss_cpu:7.2f} loss, {GlobalCounters.mem_used/1e9:.2f} GB used, {GlobalCounters.global_ops*1e-9/(cl-st):9.2f} GFLOPS")
+      print(f"{((dte-dt)+(cl-st))*1000.0:7.2f} ms run, {(et-st)*1000.0:7.2f} ms python, {(cl-et)*1000.0:7.2f} ms CL, {(dte-dt)*1000.0:7.2f} ms fetch data, {loss_cpu:7.2f} loss, {GlobalCounters.mem_used/1e9:.2f} GB used, {GlobalCounters.global_ops*1e-9/(cl-st):9.2f} GFLOPS")
       # wandb.log({"lr": scheduler.get_lr().numpy().item(),
       #            "train/data_time": data_time,
       #            "train/python_time": et - st,
@@ -95,6 +98,7 @@ def train_resnet():
       #            "train/loss": loss_cpu,
       #            "train/GFLOPS": GlobalCounters.global_ops*1e-9/(cl-st),
       # })
+      dt = time.perf_counter()
 
     # "eval" loop. Evaluate every 4 epochs, starting with epoch 1
     if e % 4 == 1:
@@ -116,6 +120,7 @@ def train_resnet():
         eval_top_1_acc.append(top_1_acc)
         eval_top_5_acc.append(top_5_acc)
 
+      print(f"eval loss: {sum(eval_loss) / len(eval_loss):.2f}, eval time: {sum(eval_times) / len(eval_times):.2f}, eval top 1 acc: {sum(eval_top_1_acc) / len(eval_top_1_acc):.2f}, eval top 5 acc: {sum(eval_top_5_acc) / len(eval_top_5_acc):.2f}")
       # wandb.log({"eval/loss": sum(eval_loss) / len(eval_loss),
       #           "eval/forward_time": sum(eval_times) / len(eval_times),
       #           "eval/top_1_acc": sum(eval_top_1_acc) / len(eval_top_1_acc),
