@@ -21,8 +21,14 @@ class TensorCore(NamedTuple):
 
 # TODO(TC): doesn't belong here!!!
 tensor_cores: Dict[str, List[TensorCore]] = {
-  "METAL": [TensorCore(device="METAL", dims=[8,8,8], dtype_in=dtypes.float, dtype_out=dtypes.float, threads=[2,4,2,2], thread_local_sizes=[2,2,2], thread_local_aliases=[ [[-1, 1, 3], [0], [2, 4]], [[2, 4], [-1, 1, 3], [0]], [[0], [-1, 1, 3], [2, 4]] ], arch="arm64")],
-  "HIP": [TensorCore(device="HIP", dims=[16,16,16], dtype_in=dtypes.half, dtype_out=dtypes.float, threads=[16,2], thread_local_sizes=[16,16,8], thread_local_aliases=[ [[-1], [0], [1]], [[-1], [1], [0]], [[0], [1], [2, -1]] ])]
+  "METAL": [
+    TensorCore(device="METAL", dims=[8,8,8], dtype_in=dtypes.float, dtype_out=dtypes.float, threads=[2,4,2,2], thread_local_sizes=[2,2,2], thread_local_aliases=[ [[-1, 1, 3], [0], [2, 4]], [[2, 4], [-1, 1, 3], [0]], [[0], [-1, 1, 3], [2, 4]] ], arch="arm64"),
+    TensorCore(device="METAL", dims=[8,8,8], dtype_in=dtypes.half,  dtype_out=dtypes.half,  threads=[2,4,2,2], thread_local_sizes=[2,2,2], thread_local_aliases=[ [[-1, 1, 3], [0], [2, 4]], [[2, 4], [-1, 1, 3], [0]], [[0], [-1, 1, 3], [2, 4]] ], arch="arm64")
+  ],
+  "HIP": [
+    TensorCore(device="HIP", dims=[16,16,16], dtype_in=dtypes.half, dtype_out=dtypes.float, threads=[16,2], thread_local_sizes=[16,16,8], thread_local_aliases=[ [[-1], [0], [1]], [[-1], [1], [0]], [[0], [1], [2, -1]] ]),
+    TensorCore(device="HIP", dims=[16,16,16], dtype_in=dtypes.half, dtype_out=dtypes.half,  threads=[16,2], thread_local_sizes=[16,16,8], thread_local_aliases=[ [[-1], [0], [1]], [[-1], [1], [0]], [[0], [1], [2, -1]] ]),
+  ]
 }
 
 class LocalBuffer(NamedTuple):

@@ -129,7 +129,7 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp]) -> st
       depth -= 1
       kk("}")
     elif uop == UOps.WMMA:
-      if args == "METAL":
+      if args[0] == "METAL":
         # ((lidx2*32)+(lidx3*4)+(lidx4*16)+(lidx5*8)+(lidx6*2))
         kk("{ simdgroup_float8x8 a,b,c;")
         kk(f"a.thread_elements()[0] = {r[vin[0]]}; a.thread_elements()[1] = {r[vin[1]]};")
@@ -137,7 +137,7 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp]) -> st
         kk(f"c.thread_elements()[0] = {r[vin[4]]}; c.thread_elements()[1] = {r[vin[5]]};")
         kk("simdgroup_multiply_accumulate(c, a, b, c);")
         kk(f"{r[vin[4]]} = c.thread_elements()[0]; {r[vin[5]]} = c.thread_elements()[1]; }}")
-      elif args == "HIP":
+      elif args[0] == "HIP":
         kk("{")
         kk(f"half16 a_frag = {{ {','.join(['(half)'+r[x] for x in vin[0:16]])} }};")
         kk(f"half16 b_frag = {{ {','.join(['(half)'+r[x] for x in vin[16:32]])} }};")
