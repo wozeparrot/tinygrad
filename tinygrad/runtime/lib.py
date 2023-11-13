@@ -38,7 +38,7 @@ class RawBufferCopyIn(RawBuffer):
 class RawBufferMapped(RawBufferCopyIn):
   def _buffer(self) -> memoryview: raise NotImplementedError("must be implemented")
   # NOTE: this metadata prevents the backing buffer from being freed. hack can be removed with PEP688
-  def buffer_view(self) -> np.ndarray: return np.frombuffer(self._buffer(), dtype=np.dtype(self.dtype.np, metadata={"backing": self}), count=self.size)  # type: ignore
+  def buffer_view(self) -> np.ndarray: return np.frombuffer(self._buffer(), dtype=np.dtype(self.dtype.np, metadata={"backing": self}), count=self.size)
   def toCPU(self) -> np.ndarray: return self.buffer_view().copy() # Need a copy, since jit will write to the same buffer.
   def _copyin(self, x:np.ndarray) -> None: np.copyto(self.buffer_view(), x.reshape(-1))
 
@@ -76,15 +76,21 @@ class LRUAllocator:
     GlobalCounters.mem_cached -= self._underlying_buf_memsz(rawbufs[0][0])
     return rawbufs.popleft()[0]
 
-  def ensure_has_free_space(self, size, dtype, device):
-    while len(self.aging_order[device]) and (self.free_space[device]-size*dtype.itemsize) < 0: # When OOM removing lru buffers.
+  def ensure_has_free_space(self, space_to_free, device):
+    while len(self.aging_order[device]) and self._get_cur_free_space(device) < space_to_free: # When OOM removing lru buffers.
       bucket, epoch = self.aging_order[device].popleft()
       if self.cached_buffers[bucket] and self.cached_buffers[bucket][-1][1] == epoch: self._free_buffer(self.cached_buffers[bucket].pop()[0]) # Free cached buffer if it is still in cache.
 
   def _alloc_buffer(self, size, dtype, device, **kwargs):
-    self.ensure_has_free_space(size, dtype, device)
+    self.ensure_has_free_space(size*dtype.itemsize, device)
+    while True: 
+      try: 
+        newbuf = self._do_alloc(max(1, size), dtype, device, **kwargs)
+        break
+      except Exception:
+        if len(self.aging_order[device]) == 0: raise
+        self.ensure_has_free_space(1.1*self._get_cur_free_space(device), device) # increase free space by 10% and try again.
     self.free_space[device] -= size*dtype.itemsize
-    newbuf = self._do_alloc(max(1, size), dtype, device, **kwargs)
     self.buffer_info[newbuf] = (size, dtype, device)
     return newbuf
 
@@ -109,3 +115,4 @@ class LRUAllocator:
   def _cached_bufkey(self, size, dtype, device) -> Tuple[int, ...]: return (device, size, dtype, dtype.shape) if isinstance(dtype, ImageDType) else (device, size, dtype) # Provides a key for reusing device buffers with identical keys.
   def _do_alloc(self, size, dtype, device, **kwargs): raise NotImplementedError("must be implemented")
   def _do_free(self, buf): pass
+  def _get_cur_free_space(self, device): return self.free_space[device]
