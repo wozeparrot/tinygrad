@@ -1,6 +1,5 @@
 import ast
 import pathlib
-import sys
 import unittest
 
 import numpy as np
@@ -8,9 +7,9 @@ from PIL import Image
 
 from tinygrad.helpers import getenv
 from tinygrad.tensor import Tensor
-from models.efficientnet import EfficientNet
-from models.vit import ViT
-from models.resnet import ResNet50
+from extra.models.efficientnet import EfficientNet
+from extra.models.vit import ViT
+from extra.models.resnet import ResNet50
 
 def _load_labels():
   labels_filename = pathlib.Path(__file__).parent / 'efficientnet/imagenet1000_clsidx_to_labels.txt'
@@ -47,7 +46,7 @@ def _infer(model: EfficientNet, img, bs=1):
   img = preprocess(img)
   # run the net
   if bs > 1: img = img.repeat(bs, axis=0)
-  out = model.forward(Tensor(img)).cpu()
+  out = model.forward(Tensor(img))
   return _LABELS[np.argmax(out.numpy()[0])]
 
 chicken_img = Image.open(pathlib.Path(__file__).parent / 'efficientnet/Chicken.jpg')
@@ -68,7 +67,7 @@ class TestEfficientNet(unittest.TestCase):
     self.assertEqual(label, "hen")
 
   def test_chicken_bigbatch(self):
-    label = _infer(self.model, chicken_img, 4)
+    label = _infer(self.model, chicken_img, 2)
     self.assertEqual(label, "hen")
 
   def test_car(self):

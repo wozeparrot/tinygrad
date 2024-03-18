@@ -1,13 +1,13 @@
 import random
 import functools
 from pathlib import Path
-import requests
 import numpy as np
 import nibabel as nib
 from scipy import signal
 import torch
 import torch.nn.functional as F
 from tinygrad.tensor import Tensor
+from tinygrad.helpers import fetch
 
 BASEDIR = Path(__file__).parent / "kits19" / "data"
 
@@ -19,14 +19,14 @@ cd kits19
 pip3 install -r requirements.txt
 python3 -m starter_code.get_imaging
 cd ..
-mv kits extra/datasets
+mv kits19 extra/datasets
 ```
 """
 
 @functools.lru_cache(None)
 def get_val_files():
-  data = requests.get("https://raw.githubusercontent.com/mlcommons/training/master/image_segmentation/pytorch/evaluation_cases.txt")
-  return sorted([x for x in BASEDIR.iterdir() if x.stem.split("_")[-1] in data.text.split("\n")])
+  data = fetch("https://raw.githubusercontent.com/mlcommons/training/master/image_segmentation/pytorch/evaluation_cases.txt").read_text()
+  return sorted([x for x in BASEDIR.iterdir() if x.stem.split("_")[-1] in data.split("\n")])
 
 def load_pair(file_path):
   image, label = nib.load(file_path / "imaging.nii.gz"), nib.load(file_path / "segmentation.nii.gz")
@@ -91,7 +91,7 @@ def pad_input(volume, roi_shape, strides, padding_mode="constant", padding_val=-
   return F.pad(torch.from_numpy(volume), paddings, mode=padding_mode, value=padding_val).numpy(), paddings
 
 def sliding_window_inference(model, inputs, labels, roi_shape=(128, 128, 128), overlap=0.5):
-  from tinygrad.jit import TinyJit
+  from tinygrad.features.jit import TinyJit
   mdl_run = TinyJit(lambda x: model(x).realize())
   image_shape, dim = list(inputs.shape[2:]), len(inputs.shape[2:])
   strides = [int(roi_shape[i] * (1 - overlap)) for i in range(dim)]

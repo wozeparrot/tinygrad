@@ -1,18 +1,13 @@
 #!/usr/bin/env python
 import unittest
-from typing import NamedTuple, Tuple
-from tinygrad.ops import LazyOp, BinaryOps, ReduceOps, get_lazyop_info
-from tinygrad.helpers import DType, dtypes
-
-class TestBuffer(NamedTuple):
-  __test__ = False # To prevent pytest from collecting this as a test
-  shape: Tuple[int, ...]
-  dtype: DType
+from tinygrad import dtypes
+from tinygrad.ops import LazyOp, BinaryOps, ReduceOps, get_lazyop_info, BufferOps, MemBuffer
+from tinygrad.shape.shapetracker import ShapeTracker
 
 class TestFlopCounter(unittest.TestCase):
   def setUp(self):
-    self.buf0 = TestBuffer(shape=(4,), dtype=dtypes.float32)
-    self.buf1 = TestBuffer(shape=(4,), dtype=dtypes.float32)
+    self.buf0 = LazyOp(BufferOps.LOAD, (), MemBuffer(1, dtypes.float32, ShapeTracker.from_shape((4,))))
+    self.buf1 = LazyOp(BufferOps.LOAD, (), MemBuffer(2, dtypes.float32, ShapeTracker.from_shape((4,))))
 
   def test_flops_add(self):
     op0 = LazyOp(BinaryOps.ADD, (self.buf0,self.buf1,), None)
@@ -40,7 +35,7 @@ class TestFlopCounter(unittest.TestCase):
 
   def test_flops_red(self):
     op0 = LazyOp(BinaryOps.MUL, (self.buf0,self.buf1,), None)
-    op1 = LazyOp(ReduceOps.SUM, (op0,), (1,))
+    op1 = LazyOp(ReduceOps.SUM, (op0,), (0,))
     op2 = LazyOp(BinaryOps.ADD, (op1, op1,), None)
     info = get_lazyop_info(op2)
     self.assertEqual(info.flops, 9)

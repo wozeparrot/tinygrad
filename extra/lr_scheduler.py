@@ -6,7 +6,7 @@ from tinygrad.tensor import Tensor
 class LR_Scheduler:
   def __init__(self, optimizer: Optimizer):
     self.optimizer = optimizer
-    self.epoch_counter = Tensor([0], requires_grad=False)
+    self.epoch_counter = Tensor([0], requires_grad=False, device=self.optimizer.device)
 
   def get_lr(self): pass
 
@@ -61,15 +61,15 @@ class CosineAnnealingLR(LR_Scheduler):
     self.eta_max = optimizer.lr.numpy()[0]
 
   def get_lr(self) -> Tensor:
-    return Tensor([self.eta_min + 0.5 * (self.eta_max - self.eta_min) * (1 + math.cos((self.epoch_counter.numpy()[0]/self.T_max) * math.pi))])
+    return Tensor([self.eta_min + 0.5 * (self.eta_max - self.eta_min) * (1 + math.cos((self.epoch_counter.numpy()[0]/self.T_max) * math.pi))], device=self.optimizer.device)
 
 class OneCycleLR(LR_Scheduler):
   def __init__(self, optimizer: Optimizer, max_lr: float, div_factor: float, final_div_factor: float, total_steps: int, pct_start: float,
                anneal_strategy: str = 'linear', cycle_momentum: bool = False):
-    self.initial_lr = Tensor([max_lr / div_factor]).contiguous()
-    self.max_lr = Tensor([max_lr]).contiguous()
-    self.min_lr = self.initial_lr/final_div_factor
     super().__init__(optimizer)
+    self.initial_lr = max_lr / div_factor
+    self.max_lr = max_lr
+    self.min_lr = self.initial_lr / final_div_factor
     self.total_steps = total_steps
     self.pct_start = pct_start
     assert anneal_strategy == 'linear', 'only linear annealing supported'
@@ -77,7 +77,7 @@ class OneCycleLR(LR_Scheduler):
     self.optimizer.lr.assign(self.get_lr()).realize() # update the initial LR
 
   @staticmethod
-  def _annealing_linear(start: Tensor, end: Tensor, pct: Tensor) -> Tensor: return ((end - start) * pct + start)
+  def _annealing_linear(start: float, end: float, pct: Tensor) -> Tensor: return (pct*(end-start)+start)
 
   def get_lr(self) -> Tensor:
     return (self.epoch_counter < self.total_steps*self.pct_start).where(

@@ -2,7 +2,7 @@ import json
 import pathlib
 import zipfile
 import numpy as np
-from extra.utils import download_file
+from tinygrad.helpers import fetch
 import pycocotools._mask as _mask
 from examples.mask_rcnn import Masker
 from pycocotools.coco import COCO
@@ -19,16 +19,14 @@ def create_dict(key_row, val_row, rows): return {row[key_row]:row[val_row] for r
 
 
 if not pathlib.Path(BASEDIR/'val2017').is_dir():
-  fn = BASEDIR/'val2017.zip'
-  download_file('http://images.cocodataset.org/zips/val2017.zip',fn)
+  fn = fetch('http://images.cocodataset.org/zips/val2017.zip')
   with zipfile.ZipFile(fn, 'r') as zip_ref:
     zip_ref.extractall(BASEDIR)
   fn.unlink()
-    
+
 
 if not pathlib.Path(BASEDIR/'annotations').is_dir():
-  fn = BASEDIR/'annotations_trainval2017.zip'
-  download_file('http://images.cocodataset.org/annotations/annotations_trainval2017.zip',fn)
+  fn = fetch('http://images.cocodataset.org/annotations/annotations_trainval2017.zip')
   with zipfile.ZipFile(fn, 'r') as zip_ref:
     zip_ref.extractall(BASEDIR)
   fn.unlink()
@@ -178,7 +176,7 @@ def evaluate_predictions_on_coco(json_result_file, iou_type="bbox"):
   with open(json_result_file, "r") as f:
     for line in f:
       coco_results.append(json.loads(line))
-  
+
   coco_gt = COCO(str(BASEDIR/'annotations/instances_val2017.json'))
   set_of_json = remove_dup([json.dumps(d, cls=NpEncoder) for d in coco_results])
   unique_list = [json.loads(s) for s in set_of_json]
@@ -186,7 +184,7 @@ def evaluate_predictions_on_coco(json_result_file, iou_type="bbox"):
   with open(f'{json_result_file}.flattend', "w") as f:
     json.dump(unique_list, f)
 
-  coco_dt = coco_gt.loadRes(str(f'{json_result_file}.flattend')) 
+  coco_dt = coco_gt.loadRes(str(f'{json_result_file}.flattend'))
   coco_eval = COCOeval(coco_gt, coco_dt, iou_type)
   coco_eval.evaluate()
   coco_eval.accumulate()

@@ -1,35 +1,41 @@
 import numpy as np
 from tqdm import trange
-from tinygrad.tensor import Tensor, Device
-from tinygrad.helpers import getenv
+from tinygrad.tensor import Tensor
+from tinygrad.helpers import CI
+from tinygrad.features.jit import TinyJit
+
 
 def train(model, X_train, Y_train, optim, steps, BS=128, lossfn=lambda out,y: out.sparse_categorical_crossentropy(y),
-        transform=lambda x: x, target_transform=lambda x: x, noloss=False):
-  Tensor.training = True
-  losses, accuracies = [], []
-  for i in (t := trange(steps, disable=getenv('CI', False))):
-    samp = np.random.randint(0, X_train.shape[0], size=(BS))
-    x = Tensor(transform(X_train[samp]), requires_grad=False)
-    y = Tensor(target_transform(Y_train[samp]))
+        transform=lambda x: x, target_transform=lambda x: x, noloss=False, allow_jit=True):
 
+  def train_step(x, y):
     # network
     out = model.forward(x) if hasattr(model, 'forward') else model(x)
-
     loss = lossfn(out, y)
     optim.zero_grad()
     loss.backward()
     if noloss: del loss
     optim.step()
+    if noloss: return (None, None)
+    cat = out.argmax(axis=-1)
+    accuracy = (cat == y).mean()
+    return loss.realize(), accuracy.realize()
 
-    # printing
-    if not noloss:
-      cat = out.argmax(axis=-1)
-      accuracy = (cat == y).mean().numpy()
+  if allow_jit: train_step = TinyJit(train_step)
 
-      loss = loss.detach().numpy()
-      losses.append(loss)
-      accuracies.append(accuracy)
-      t.set_description("loss %.2f accuracy %.2f" % (loss, accuracy))
+  with Tensor.train():
+    losses, accuracies = [], []
+    for i in (t := trange(steps, disable=CI)):
+      samp = np.random.randint(0, X_train.shape[0], size=(BS))
+      x = Tensor(transform(X_train[samp]), requires_grad=False)
+      y = Tensor(target_transform(Y_train[samp]))
+      loss, accuracy = train_step(x, y)
+      # printing
+      if not noloss:
+        loss, accuracy = loss.numpy(), accuracy.numpy()
+        losses.append(loss)
+        accuracies.append(accuracy)
+        t.set_description("loss %.2f accuracy %.2f" % (loss, accuracy))
   return [losses, accuracies]
 
 
@@ -38,7 +44,7 @@ def evaluate(model, X_test, Y_test, num_classes=None, BS=128, return_predict=Fal
   Tensor.training = False
   def numpy_eval(Y_test, num_classes):
     Y_test_preds_out = np.zeros(list(Y_test.shape)+[num_classes])
-    for i in trange((len(Y_test)-1)//BS+1, disable=getenv('CI', False)):
+    for i in trange((len(Y_test)-1)//BS+1, disable=CI):
       x = Tensor(transform(X_test[i*BS:(i+1)*BS]))
       out = model.forward(x) if hasattr(model, 'forward') else model(x)
       Y_test_preds_out[i*BS:(i+1)*BS] = out.numpy()

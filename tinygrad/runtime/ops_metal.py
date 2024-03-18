@@ -1,88 +1,106 @@
-# pip3 install pyobjc-framework-Metal pyobjc-framework-Cocoa pyobjc-framework-libdispatch
-import os, subprocess, pathlib, functools, ctypes
-import Metal, Cocoa, libdispatch # type: ignore
-from typing import List, Any
+from __future__ import annotations
+import os, subprocess, pathlib, ctypes, tempfile, functools
+import Metal, libdispatch
+from typing import List, Set, Any, Tuple, Optional
 from tinygrad.codegen.kernel import LinearizerOptions
-from tinygrad.renderer.cstyle import uops_to_cstyle, CStyleLanguage
-from tinygrad.helpers import prod, getenv, DEBUG, DType, dtypes
-from tinygrad.ops import Compiled
-from tinygrad.runtime.lib import RawBufferMapped, LRUAllocator
+from tinygrad.helpers import prod, getenv, DEBUG, unwrap2
+from tinygrad.device import Compiled, LRUAllocator, Compiler
+from tinygrad.renderer.cstyle import MetalRenderer
 
-METAL_XCODE = getenv("METAL_XCODE")
+def wait_check(cbuf: Any):
+  cbuf.waitUntilCompleted()
+  if (error := cbuf.error()) is not None:
+    raise RuntimeError(error)
 
-class MetalAllocator(LRUAllocator):
-  def _do_alloc(self, size, dtype, device, **kwargs): return METAL.device.newBufferWithLength_options_(size*dtype.itemsize, Metal.MTLResourceStorageModeShared)
-  def _do_free(self, buf): buf.release()
-  def _cached_bufkey(self, size, dtype, device): return (device, size*dtype.itemsize) # Buffers of the same length could be reused, no matter what dtype.
-
-class _METAL:
-  def __init__(self):
-    self.mtl_buffers_in_flight: List[Any] = []
-    self.device = Metal.MTLCreateSystemDefaultDevice()
-    self.mtl_queue = self.device.newCommandQueueWithMaxCommandBufferCount_(1024)
-    self.allocator = MetalAllocator(self.device.dedicatedMemorySize() or self.device.sharedMemorySize())
-  # TODO: is there a better way to do this?
-  def synchronize(self):
-    for cbuf in self.mtl_buffers_in_flight: cbuf.waitUntilCompleted()
-    self.mtl_buffers_in_flight.clear()
-METAL = _METAL()
-
-class RawMetalBuffer(RawBufferMapped):
-  def __init__(self, size:int, dtype:DType):
-    assert dtype != dtypes.double, f"METAL does not support {dtype.name}"
-    super().__init__(size, dtype, allocator=METAL.allocator)
-  def _buffer(self):
-    METAL.synchronize()
-    return self._buf.contents().as_buffer(self._buf.length())
-
-def unwrap(x):
-  ret, err = x
-  assert err is None, str(err)
-  return ret
+class MetalCompiler(Compiler):
+  linearizer_opts = LinearizerOptions("METAL", has_tensor_cores=os.uname().machine == "arm64", shared_max=32768)
+  def __init__(self, device:Optional[MetalDevice]):
+    self.device = device
+    super().__init__("compile_metal")
+  def render(self, name:str, uops) -> str: return MetalRenderer(name, uops)
+  def compile(self, src:str) -> bytes:
+    if self.device is None:
+      # NOTE: if you run llvm-dis on "air" you can see the llvm bytecode
+      air = subprocess.check_output(['xcrun', '-sdk', 'macosx', 'metal', '-x', 'metal', '-c', '-', '-o', '-'], input=src.encode('utf-8'))
+      return subprocess.check_output(['xcrun', '-sdk', 'macosx', 'metallib', '-', '-o', '-'], input=air)
+    else:
+      options = Metal.MTLCompileOptions.new()
+      options.setFastMathEnabled_(getenv("METAL_FAST_MATH"))
+      library = unwrap2(self.device.device.newLibraryWithSource_options_error_(src, options, None))
+      return library.libraryDataContents().bytes().tobytes()
 
 class MetalProgram:
-  def __init__(self, name:str, prg:str, binary:bool=False):
-    if METAL_XCODE:
-      air = subprocess.check_output(['xcrun', '-sdk', 'macosx', 'metal', '-x', 'metal', '-c', '-', '-o', '-'], input=prg.encode('utf-8'))
-      # NOTE: if you run llvm-dis on "air" you can see the llvm bytecode
-      lib = subprocess.check_output(['xcrun', '-sdk', 'macosx', 'metallib', '-', '-o', '-'], input=air)
-      data = libdispatch.dispatch_data_create(lib, len(lib), None, None)
-      self.library = unwrap(METAL.device.newLibraryWithData_error_(data, None))
-    else:
-      options = Metal.MTLCompileOptions.alloc().init()
-      self.library = unwrap(METAL.device.newLibraryWithSource_options_error_(prg, options, None))
+  def __init__(self, device:MetalDevice, name:str, lib:bytes):
+    self.device, self.name, self.lib = device, name, lib
+    if DEBUG >= 6:
+      with tempfile.NamedTemporaryFile(delete=True) as shader:
+        shader.write(lib)
+        shader.flush()
+        os.system(f"cd {pathlib.Path(__file__).parents[2]}/disassemblers/applegpu && python3 compiler_explorer.py {shader.name}")
+    data = libdispatch.dispatch_data_create(lib, len(lib), None, None)
+    self.library = unwrap2(self.device.device.newLibraryWithData_error_(data, None))
     self.fxn = self.library.newFunctionWithName_(name)
-    # hacks to disassemble shader
-    if DEBUG >= 5:
-      arc = unwrap(METAL.device.newBinaryArchiveWithDescriptor_error_(Metal.MTLBinaryArchiveDescriptor.alloc().init(), None))
-      desc = Metal.MTLComputePipelineDescriptor.alloc().init()
-      desc.setComputeFunction_(self.fxn)
-      unwrap(arc.addComputePipelineFunctionsWithDescriptor_error_(desc, None))
-      unwrap(arc.serializeToURL_error_(Cocoa.NSURL.URLWithString_("file:///tmp/shader.bin"), None))
-      # clone https://github.com/dougallj/applegpu.git in tinygrad/disassemblers
-      os.system(f"cd {pathlib.Path(__file__).parents[2]}/disassemblers/applegpu && python3 compiler_explorer.py /tmp/shader.bin")
-    self.pipeline_state = unwrap(METAL.device.newComputePipelineStateWithFunction_error_(self.fxn, None))
+    self.pipeline_state = unwrap2(self.device.device.newComputePipelineStateWithFunction_error_(self.fxn, None))
 
-  def __call__(self, global_size, local_size, *bufs, wait=False):
-    assert prod(local_size) <= self.pipeline_state.maxTotalThreadsPerThreadgroup(), f"local size {local_size} bigger than {self.pipeline_state.maxTotalThreadsPerThreadgroup()} with exec width {self.pipeline_state.threadExecutionWidth()} memory length {self.pipeline_state.staticThreadgroupMemoryLength()}"
-    command_buffer = METAL.mtl_queue.commandBuffer()
+  def __call__(self, *bufs, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1), vals:Tuple[int, ...]=(), wait=False):
+    if prod(local_size) > self.pipeline_state.maxTotalThreadsPerThreadgroup(): raise RuntimeError(f"local size {local_size} bigger than {self.pipeline_state.maxTotalThreadsPerThreadgroup()} with exec width {self.pipeline_state.threadExecutionWidth()} memory length {self.pipeline_state.staticThreadgroupMemoryLength()}")  # noqa: E501
+    command_buffer = self.device.mtl_queue.commandBuffer()
     encoder = command_buffer.computeCommandEncoder()
     encoder.setComputePipelineState_(self.pipeline_state)
-    for i,a in enumerate(bufs):
-      if isinstance(a, RawMetalBuffer): encoder.setBuffer_offset_atIndex_(a._buf, 0, i)
-      elif isinstance(a, int): encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
-      else: raise RuntimeError(f"arg at index {i} has unsupported type {type(a)}")
+    for i,a in enumerate(bufs): encoder.setBuffer_offset_atIndex_(a, 0, i)
+    for i,a in enumerate(vals,start=len(bufs)): encoder.setBytes_length_atIndex_(ctypes.c_int32(a), 4, i)
     encoder.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(*global_size), Metal.MTLSize(*local_size))
     encoder.endEncoding()
     command_buffer.commit()
     if wait:
-      command_buffer.waitUntilCompleted()
+      wait_check(command_buffer)
       return command_buffer.GPUEndTime() - command_buffer.GPUStartTime()
-    METAL.mtl_buffers_in_flight.append(command_buffer)
+    self.device.mtl_buffers_in_flight.append(command_buffer)
 
-renderer = functools.partial(uops_to_cstyle, CStyleLanguage(
-  kernel_prefix = "#include <metal_stdlib>\nusing namespace metal;\nkernel ", buffer_prefix = "device ", smem_prefix = "threadgroup ", arg_int_prefix = "constant int&",
-  barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);", float4 = "float4", uses_ptr_arithmetic=True,
-  gid = [f"gid.{chr(120+i)}" for i in range(3)], lid = [f"lid.{chr(120+i)}" for i in range(3)],
-  extra_args = ['uint3 gid [[threadgroup_position_in_grid]]', 'uint3 lid [[thread_position_in_threadgroup]]']))
-MetalBuffer = Compiled(RawMetalBuffer, LinearizerOptions(), renderer, MetalProgram, METAL.synchronize)
+class MetalAllocator(LRUAllocator):
+  def __init__(self, device:MetalDevice):
+    self.device:MetalDevice = device
+    self.track_cross_device: Set[MetalDevice] = set()
+    super().__init__()
+  def free_cache(self):
+    self.device.synchronize()
+    for x in self.track_cross_device: x.synchronize()
+    self.track_cross_device.clear()
+    return super().free_cache()
+  def _alloc(self, size:int) -> Any:
+    ret = self.device.device.newBufferWithLength_options_(size, Metal.MTLResourceStorageModeShared)
+    if ret is None: raise MemoryError(f"Metal OOM while allocating {size=}")
+    return ret
+  def transfer(self, dest:Any, src:Any, sz:int, **kwargs):
+    command_buffer = self.device.mtl_queue.commandBuffer()
+    encoder = command_buffer.blitCommandEncoder()
+    encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size_(src, 0, dest, 0, sz)
+    encoder.endEncoding()
+    command_buffer.commit()
+    self.device.mtl_buffers_in_flight.append(command_buffer)
+  def from_buffer(self, src:memoryview) -> Optional[Any]:
+    ret = self.device.device.newBufferWithBytesNoCopy_length_options_deallocator_(src, len(src), Metal.MTLResourceStorageModeShared, None)
+    if ret: self.device.mv_in_metal.append(src)
+    return ret
+  def _free(self, opaque:Any): opaque.release()
+  def as_buffer(self, src:Any) -> memoryview:
+    self.device.synchronize()
+    return src.contents().as_buffer(src.length())
+  def copyin(self, dest:Any, src:memoryview): self.as_buffer(dest)[:] = src
+  def copyout(self, dest:memoryview, src:Any): dest[:] = self.as_buffer(src)
+
+class MetalDevice(Compiled):
+  def __init__(self, device:str):
+    self.device = Metal.MTLCreateSystemDefaultDevice()
+    self.mtl_queue = self.device.newCommandQueueWithMaxCommandBufferCount_(1024)
+    self.mtl_buffers_in_flight: List[Any] = []
+    self.mv_in_metal: List[memoryview] = []
+    self.track_cross_buffer: List[Any] = []
+    from tinygrad.runtime.graph.metal import MetalGraph
+    super().__init__(device, MetalAllocator(self), MetalCompiler(None if getenv("METAL_XCODE") else self),
+                     functools.partial(MetalProgram, self), functools.partial(MetalGraph, self))
+  def synchronize(self):
+    for cbuf in self.mtl_buffers_in_flight: wait_check(cbuf)
+    self.mv_in_metal.clear()
+    self.mtl_buffers_in_flight.clear()
+    self.track_cross_buffer.clear()

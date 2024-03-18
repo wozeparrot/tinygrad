@@ -1,6 +1,7 @@
 __pycache__
 .venv/
 .vscode
+.DS_Store
 notebooks
 .*.swp
 .*.swo
@@ -31,8 +32,10 @@ extra/datasets/kits/
 datasets/wikipedia/
 extra/datasets/COCO/
 extra/datasets/audio*
+extra/weights
 venv
-examples/net.*[js,json,safetensors]
+examples/**/net.*[js,json]
+examples/**/*.safetensors
 node_modules
 package.json
 package-lock.json
@@ -41,4 +44,10 @@ temp
 .coverage
 coverage.xml
 htmlcov
-wandb/
+outputs_yolov8
+wandb
+model.safetensors
+quickstart.py
+.hypothesis
+weights
+*.lprof

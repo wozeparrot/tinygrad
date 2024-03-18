@@ -1,18 +1,17 @@
-from tinygrad.tensor import Tensor, Device
+from tinygrad.tensor import Tensor
 from tinygrad.helpers import getenv
 
 from extra.dist import world
 
-def allreduce(t:Tensor, cache_id=None) -> Tensor:
+def allreduce(t:Tensor) -> Tensor:
   RANK, WORLD_SIZE = getenv("RANK"), getenv("WORLD_SIZE")
-  cache_id = f"{RANK}-{cache_id}" if cache_id is not None else None
 
   # flatten
   flattened = t.flatten()
 
   # pad to evenly divide
   if flattened.shape[0] % WORLD_SIZE != 0:
-    flattened = Tensor.cat(flattened, Tensor.zeros(WORLD_SIZE - (flattened.shape[0] % WORLD_SIZE)))
+    flattened = Tensor.cat(flattened, Tensor.empty(WORLD_SIZE - (flattened.shape[0] % WORLD_SIZE)))
 
   # chunk
   chunks = flattened.chunk(WORLD_SIZE, dim=0)
@@ -22,8 +21,8 @@ def allreduce(t:Tensor, cache_id=None) -> Tensor:
 
   # scatter reduce
   current_chunk_index = RANK
-  for i in range(WORLD_SIZE - 1):
-    world.send(chunks[current_chunk_index], next_rank, cache_id=f"{cache_id}-{i}-s" if cache_id is not None else None)
+  for _ in range(WORLD_SIZE - 1):
+    world.send(chunks[current_chunk_index], next_rank)
     current_chunk_index = ((current_chunk_index - 1) + WORLD_SIZE) % WORLD_SIZE
     recv_buf = Tensor.empty(*chunks[current_chunk_index].shape)
     world.recv(recv_buf, prev_rank)
@@ -31,8 +30,8 @@ def allreduce(t:Tensor, cache_id=None) -> Tensor:
 
   # gather
   current_chunk_index = (RANK + 1) % WORLD_SIZE
-  for i in range(WORLD_SIZE - 1):
-    world.send(chunks[current_chunk_index], next_rank, cache_id=f"{cache_id}-{i}-g" if cache_id is not None else None)
+  for _ in range(WORLD_SIZE - 1):
+    world.send(chunks[current_chunk_index], next_rank)
     current_chunk_index = ((current_chunk_index - 1) + WORLD_SIZE) % WORLD_SIZE
     recv_buf = Tensor.empty(*chunks[current_chunk_index].shape)
     world.recv(recv_buf, prev_rank)
