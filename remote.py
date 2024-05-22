@@ -1,4 +1,4 @@
-import argparse, pickle, socket
+import argparse, pickle, socket, ctypes
 from socketserver import BaseRequestHandler, TCPServer
 from tinygrad import Device
 
@@ -41,56 +41,55 @@ if __name__ == "__main__":
           case b"\x03": # free
             opaque, options = pickle.loads(self.request.recv(1024))
             print(f"free {opaque=}, {options=}")
-            self.device.allocator.free(opaque, 0, options)
             del buffers[opaque.value]
+            self.device.allocator.free(opaque, 0, options)
             self.request.send(b"\x00")
           case b"\x04": # copyin
-            dest, nbytes = pickle.loads(self.request.recv(1024))
-            print(f"copyin {dest=}, {nbytes=}")
-            self.request.send(b"\x00")
+            dest = ctypes.c_ulong(int.from_bytes(self.request.recv(8), "little"))
+            print(f"copyin {dest=}")
             src = memoryview(buffers[dest.value])
-            # recv data in chunks
             total = 0
-            while total < nbytes:
-              recv = self.request.recv_into(src[total:], nbytes - total)
+            while total < src.nbytes:
+              recv = self.request.recv_into(src[total:], src.nbytes - total)
               total += recv
             self.device.allocator.copyin(dest, src)
-            self.request.send(b"\x00")
           case b"\x05": # copyout
-            src, nbytes = pickle.loads(self.request.recv(1024))
-            print(f"copyout {src=}, {nbytes=}")
+            src = ctypes.c_ulong(int.from_bytes(self.request.recv(8), "little"))
+            print(f"copyout {src=}")
             dest = buffers[src.value]
             self.device.allocator.copyout(memoryview(dest), src)
             self.request.sendall(dest)
           case b"\x06": # compile
-            nbytes = pickle.loads(self.request.recv(1024))
+            nbytes = int.from_bytes(self.request.recv(4), "little")
             print(f"compile {nbytes=}")
-            self.request.send(b"\x00")
-            src_bytes = bytearray()
-            while nbytes > 0:
-              chunk = self.request.recv(nbytes)
-              src_bytes += chunk
-              nbytes -= len(chunk)
+            src_bytes = bytearray(nbytes)
+            src_view = memoryview(src_bytes)
+            total = 0
+            while total < nbytes:
+              recv = self.request.recv_into(src_view[total:], nbytes - total)
+              total += recv
             src = src_bytes.decode("utf-8")
-            compiled = self.device.compiler.compile_cached(src)
-            self.request.sendall(pickle.dumps(len(compiled)))
-            self.request.recv(1)
-            self.request.sendall(compiled)
+            compiled = self.device.compiler.compile(src)
+            self.request.sendall(len(compiled).to_bytes(4, "little") + compiled)
           case b"\x07": # load
             name, nbytes, iden = pickle.loads(self.request.recv(1024))
-            print(f"load {nbytes=}")
+            print(f"load {name=}, {nbytes=}, {iden=}")
             self.request.send(b"\x00")
-            lib = bytearray()
-            while nbytes > 0:
-              chunk = self.request.recv(nbytes)
-              lib += chunk
-              nbytes -= len(chunk)
+            lib = bytearray(nbytes)
+            lib_view = memoryview(lib)
+            total = 0
+            while total < nbytes:
+              recv = self.request.recv_into(lib_view[total:], nbytes - total)
+              total += recv
             programs[iden] = self.device.runtime(name, bytes(lib))
+            self.request.send(b"\x00")
           case b"\x08": # run
             name, bufs, global_size, local_size, vals, wait, iden = pickle.loads(self.request.recv(4096))
             print(f"run {name=}, {global_size=}, {local_size=}, {vals=}, {wait=}, {iden=}")
-            programs[iden](*bufs, global_size=global_size, local_size=local_size, vals=vals, wait=wait)
-            self.request.send(b"\x00")
+            try: programs[iden](*bufs, global_size=global_size, local_size=local_size, vals=vals, wait=wait)
+            except: failed = 1
+            else: failed = 0
+            self.request.send(bytes([failed]))
           case b"\xff": # exit
             print("exit")
             break
