@@ -112,8 +112,8 @@ def beam_search(lin:Linearizer, rawbufs:List[Buffer], amt:int, allow_test_size=T
   beam: List[Tuple[Linearizer, float]] = [(lin, float("inf"))]
   seen_libs = set()
 
-  default_parallel = multiprocessing.cpu_count() if lin.opts.device in {"CUDA", "HSA", "AMD", "NV"} else 0
-  if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
+  default_parallel = multiprocessing.cpu_count() if lin.opts.device in {"CUDA", "HSA", "AMD", "NV", "CLANG"} else 0
+  if (workers := getenv("PARALLEL", default_parallel)) and beam_pool is None:
     beam_pool = multiprocessing.get_context("spawn").Pool(workers, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
 
   min_progress = getenv("BEAM_MIN_PROGRESS", 0.01)/1e6
@@ -129,7 +129,7 @@ def beam_search(lin:Linearizer, rawbufs:List[Buffer], amt:int, allow_test_size=T
       acted_lins: List[Linearizer] = flatten([get_linearizer_actions(lin, include_0=False).values() for lin,_ in beam])
       timed_lins: List[Tuple[Linearizer, float]] = []
       _compile_fn = functools.partial(_try_compile_linearized_w_idx, compiler=dev.compiler)
-      for i,proc in (map(_compile_fn, enumerate(acted_lins)) if beam_pool is None else beam_pool.imap_unordered(_compile_fn, enumerate(acted_lins))):
+      for i,proc in (map(_compile_fn, enumerate(acted_lins)) if not workers else beam_pool.imap_unordered(_compile_fn, enumerate(acted_lins))):
         if proc is None: continue
         p, lib, compile_et = proc
         if lib in seen_libs: continue
