@@ -207,8 +207,7 @@ if __name__ == "__main__":
   def encode_message(role: str, content: str):
     return encode_role(role) + tokenizer.encode(content.strip()) + [tokenizer.special_tokens["<|eot_id|>"]]
 
-  # device = tuple(f"{Device.DEFAULT}:{i}" for i in range(args.shard)) if args.shard > 1 else Device.DEFAULT
-  device = ("HSA:0", "HSA:1", "HSA:2", "HSA:3", "REMOTE:10.0.0.10:1234:CUDA:0", "REMOTE:10.0.0.10:1235:CUDA:1", "REMOTE:10.0.0.10:1236:CUDA:2", "REMOTE:10.0.0.10:1237:CUDA:3")
+  device = tuple(f"{Device.DEFAULT}:{i}" for i in range(args.shard)) if args.shard > 1 else Device.DEFAULT
   model = build_transformer(args.model, model_size=args.size, quantize=args.quantize, device=device)
 
   if args.api:
