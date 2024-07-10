@@ -1,6 +1,7 @@
-import argparse, pickle, socket, ctypes
+import argparse, pickle, socket
 from socketserver import BaseRequestHandler, TCPServer
 from tinygrad import Device
+from tinygrad.device import CompileError
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
@@ -18,6 +19,7 @@ if __name__ == "__main__":
 
       programs = {}
       buffers = {}
+      opaques = {}
 
       while True:
         cmd = self.request.recv(1)
@@ -35,29 +37,32 @@ if __name__ == "__main__":
             size, options = pickle.loads(self.request.recv(1024))
             print(f"allocate {size=}, {options=}")
             opaque = self.device.allocator.alloc(size, options)
-            buffers[opaque.value] = bytearray(size)
-            pickled = pickle.dumps(opaque)
+            opaques[ptr := id(opaque)] = opaque
+            buffers[ptr] = bytearray(size)
+            pickled = pickle.dumps(ptr)
             self.request.sendall(pickled)
           case b"\x03": # free
-            opaque, options = pickle.loads(self.request.recv(1024))
-            print(f"free {opaque=}, {options=}")
-            del buffers[opaque.value]
+            ptr, options = pickle.loads(self.request.recv(1024))
+            print(f"free {ptr=}, {options=}")
+            del buffers[ptr]
+            opaque = opaques[ptr]
             self.device.allocator.free(opaque, 0, options)
+            del opaques[ptr]
             self.request.send(b"\x00")
           case b"\x04": # copyin
-            dest = ctypes.c_ulong(int.from_bytes(self.request.recv(8), "little"))
-            print(f"copyin {dest=}")
-            src = memoryview(buffers[dest.value])
+            ptr = int.from_bytes(self.request.recv(8), "little")
+            print(f"copyin {ptr=}")
+            src = memoryview(buffers[ptr])
             total = 0
             while total < src.nbytes:
               recv = self.request.recv_into(src[total:], src.nbytes - total)
               total += recv
-            self.device.allocator.copyin(dest, src)
+            self.device.allocator.copyin(opaques[ptr], src)
           case b"\x05": # copyout
-            src = ctypes.c_ulong(int.from_bytes(self.request.recv(8), "little"))
-            print(f"copyout {src=}")
-            dest = buffers[src.value]
-            self.device.allocator.copyout(memoryview(dest), src)
+            ptr = int.from_bytes(self.request.recv(8), "little")
+            print(f"copyout {ptr=}")
+            dest = buffers[ptr]
+            self.device.allocator.copyout(memoryview(dest), opaques[ptr])
             self.request.sendall(dest)
           case b"\x06": # compile
             nbytes = int.from_bytes(self.request.recv(4), "little")
@@ -69,7 +74,8 @@ if __name__ == "__main__":
               recv = self.request.recv_into(src_view[total:], nbytes - total)
               total += recv
             src = src_bytes.decode("utf-8")
-            compiled = self.device.compiler.compile(src)
+            try: compiled = self.device.compiler.compile(src)
+            except CompileError: compiled = b""
             self.request.sendall(len(compiled).to_bytes(4, "little") + compiled)
           case b"\x07": # load
             name, nbytes, iden = pickle.loads(self.request.recv(1024))
@@ -84,8 +90,9 @@ if __name__ == "__main__":
             programs[iden] = self.device.runtime(name, bytes(lib))
             self.request.send(b"\x00")
           case b"\x08": # run
-            name, bufs, global_size, local_size, vals, wait, iden = pickle.loads(self.request.recv(4096))
+            name, buf_ptrs, global_size, local_size, vals, wait, iden = pickle.loads(self.request.recv(4096))
             print(f"run {name=}, {global_size=}, {local_size=}, {vals=}, {wait=}, {iden=}")
+            bufs = [opaques[ptr] for ptr in buf_ptrs]
             try: programs[iden](*bufs, global_size=global_size, local_size=local_size, vals=vals, wait=wait)
             except: failed = 1
             else: failed = 0
@@ -101,4 +108,5 @@ if __name__ == "__main__":
   server.allow_reuse_address = True
   server.allow_reuse_port = True
   server.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+  print(f"Listening on {server.server_address}")
   with server: server.serve_forever()
