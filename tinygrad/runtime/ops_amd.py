@@ -883,8 +883,8 @@ class AMDDevice(HCQCompiled):
     self.sdma = import_module('sdma', min(self.dev_iface.ip_versions[am.SDMA0_HWIP], (6, 0, 0)))
     self.gc = AMDIP('gc', self.dev_iface.ip_versions[am.GC_HWIP], self.dev_iface.ip_offsets[am.GC_HWIP])
     nbio_ver = self.dev_iface.ip_versions[am.NBIF_HWIP]
-    if nbio_ver[:2] == (3, 3):
-      nbio_ver = (2, 3, 0)
+    if nbio_ver[:2] == (3, 3): nbio_ver = (2, 3, 0)
+    if nbio_ver == (7, 5, 0): nbio_ver = (2, 3, 0)
     nbio_pad = (0,) if self.target[0] == 9 else ()
     self.nbio = AMDIP('nbio' if self.target[0]<12 else 'nbif', nbio_ver, nbio_pad+self.dev_iface.ip_offsets[am.NBIF_HWIP])
 
