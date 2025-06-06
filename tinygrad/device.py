@@ -23,7 +23,7 @@ class _Device:
   @functools.cache  # this class is a singleton, pylint: disable=method-cache-max-size-none
   def __get_canonicalized_item(self, ix:str) -> Compiled:
     cpn = multiprocessing.current_process().name
-    assert (cpn == "MainProcess") or ix.split(":")[0] in ["DISK", "NPY", "PYTHON"], f"can only open device {ix} from parent, not {cpn}"
+    assert (cpn == "MainProcess") or ix.split(":")[0] in ["DISK", "NPY", "HTTP", "PYTHON"], f"can only open device {ix} from parent, not {cpn}"
     x = ix.split(":")[0].lower()
     ret = [cls for cname, cls in inspect.getmembers(importlib.import_module(f'tinygrad.runtime.ops_{x}')) \
            if (cname.lower() == x + "device")][0](ix)
@@ -37,7 +37,7 @@ class _Device:
       with contextlib.suppress(Exception): yield self[device].device
   @functools.cached_property
   def DEFAULT(self) -> str:
-    from_env = [d for d in self._devices if d not in ["DISK", "NPY"] and getenv(d) == 1]
+    from_env = [d for d in self._devices if d not in ["DISK", "NPY", "HTTP"] and getenv(d) == 1]
     assert len(from_env) < 2, f"multiple devices set in env: {from_env}"
     if len(from_env) == 1: return from_env[0]
     try:
