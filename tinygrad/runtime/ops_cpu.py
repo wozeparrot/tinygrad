@@ -1,25 +1,12 @@
 from __future__ import annotations
-import platform, subprocess, sys, ctypes, functools, time, mmap
-from tinygrad.helpers import capstone_flatdump, getenv, from_mv, to_mv, OSX, mv_address, wait_cond
-from tinygrad.device import Compiler, BufferSpec, DMACPURef
+import platform, sys, ctypes, ctypes.util, functools, time, mmap
+from tinygrad.helpers import getenv, from_mv, to_mv, OSX, mv_address, wait_cond
+from tinygrad.device import BufferSpec, DMACPURef
+from tinygrad.renderer.llvmir import LLVMRenderer
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocatorBase, HCQBuffer, HWQueue, HCQArgsState, HCQSignal, HCQProgram, MMIOInterface
-from tinygrad.runtime.support.elf import jit_loader
 from tinygrad.renderer.cstyle import ClangRenderer
+from tinygrad.runtime.support.compiler_cpu import ClangJITCompiler, HostLLVMCompiler
 from tinygrad.uop.ops import sint
-
-class ClangJITCompiler(Compiler):
-  def __init__(self, cachekey="compile_clang_jit"): super().__init__(cachekey)
-
-  def compile(self, src:str) -> bytes:
-    # -fno-math-errno is required for __builtin_sqrt to become an instruction instead of a function call
-    # x18 is a reserved platform register. It is clobbered on context switch in macos and is used to store TEB pointer in windows on arm, don't use it
-    target = 'x86_64' if sys.platform == 'win32' else platform.machine()
-    args = ['-march=native', f'--target={target}-none-unknown-elf', '-O2', '-fPIC', '-ffreestanding', '-fno-math-errno', '-nostdlib', '-fno-ident']
-    arch_args = ['-ffixed-x18'] if target == 'arm64' else []
-    obj = subprocess.check_output([getenv("CC", 'clang'), '-c', '-x', 'c', *args, *arch_args, '-', '-o', '-'], input=src.encode('utf-8'))
-    return jit_loader(obj)
-
-  def disassemble(self, lib:bytes): return capstone_flatdump(lib)
 
 class CPUComputeQueue(HWQueue):
   def _exec(self, prg, bufs, *args):
@@ -99,5 +86,6 @@ class CPUAllocator(HCQAllocatorBase):
 
 class CPUDevice(HCQCompiled):
   def __init__(self, device:str=""):
-    super().__init__(device, CPUAllocator(self), ClangRenderer(), ClangJITCompiler(), functools.partial(CPUProgram, self), HCQSignal, CPUComputeQueue,
-                     supports_graph=False)
+    super().__init__(device, CPUAllocator(self), LLVMRenderer() if getenv("LLVM", 0) else ClangRenderer(),
+                     HostLLVMCompiler() if getenv("LLVM", 0) else ClangJITCompiler(),
+                     functools.partial(CPUProgram, self), HCQSignal, CPUComputeQueue, supports_graph=False)

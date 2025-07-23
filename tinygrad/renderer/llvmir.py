@@ -113,7 +113,7 @@ base_rewrite = PatternMatcher([
 ])
 
 class LLVMRenderer(Renderer):
-  device = "LLVM"
+  device = "CPU"
   abi = 'win64cc' if sys.platform == 'win32' else None
   supports_float4 = True
   has_local = False
@@ -169,7 +169,7 @@ class LLVMRenderer(Renderer):
       elif u.op in (Ops.DEFINE_LOCAL, Ops.DEFINE_REG):
         r[u] = f"%{'local' if u.op is Ops.DEFINE_LOCAL else 'reg'}_{str(u.arg).replace('(', '').replace(')', '').replace(',', '_').replace(' ', '')}"
         assert isinstance(u.dtype, PtrDType)
-        if self.device == "LLVM" or u.op is Ops.DEFINE_REG:
+        if self.device == "CPU" or u.op is Ops.DEFINE_REG:
           # put alloca in the beginning of the function always
           kernel = [f"  {r[u]} = alloca [{u.dtype.size} x {ldt(u.dtype.base)}]"] + kernel
           if u.op is Ops.DEFINE_REG:
