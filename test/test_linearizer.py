@@ -11,7 +11,7 @@ from tinygrad.shape.view import View
 from tinygrad.tensor import Tensor, _to_np_dtype
 from tinygrad.engine.realize import run_schedule, lower_schedule, CompiledRunner, get_program
 from tinygrad.opt.heuristic import hand_coded_optimizations
-from tinygrad.helpers import prod, Context, getenv, CI, flatten, dedup, AMX, AMD_LLVM
+from tinygrad.helpers import prod, Context, getenv, CI, flatten, dedup, AMX
 from tinygrad.dtype import DType, dtypes, AddrSpace
 
 def helper_realized_ast(r:Tensor|list[Tensor]) -> tuple[UOp, list[Buffer]]:
@@ -366,9 +366,9 @@ class TestLinearizer(unittest.TestCase):
       kernel = Kernel(realized_ast)
       kernel.apply_tensor_cores(1, axis=0, tc_select=-1, tc_opt=2)
       prg = get_program(kernel.get_optimized_ast(), kernel.opts)
-      if Device.DEFAULT == "LLVM":
+      if Device.DEFAULT == "CPU" and getenv("LLVM", 0):
         assert "0x201000" in prg.src
-      elif Device.DEFAULT == "AMD" and AMD_LLVM:
+      elif Device.DEFAULT == "AMD" and getenv("LLVM", 1):
         assert "@llvm.amdgcn.wmma" in prg.src
       elif Device[Device.DEFAULT].renderer.suffix == "PTX":
         assert "mma.sync.aligned" in prg.src
@@ -461,7 +461,7 @@ class TestLinearizer(unittest.TestCase):
         assert u.src[-1].src[0].op != Ops.ASSIGN
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
-  @unittest.skipIf(Device.DEFAULT in {"CPU", "LLVM"}, "CPU does not support using a different type for accumulation")
+  @unittest.skipIf(Device.DEFAULT in {"CPU"}, "CPU does not support using a different type for accumulation")
   def test_tensor_cores_unroll_casted_phi(self):
     tc = [tc for tc in Device[Device.DEFAULT].renderer.tensor_cores if tc.dtype_in != tc.dtype_out][0]
     x, y = Tensor.rand(128, 128, dtype=tc.dtype_in), Tensor.rand(128, 128, dtype=tc.dtype_in)
@@ -473,7 +473,7 @@ class TestLinearizer(unittest.TestCase):
         assert u.src[-1].src[0].op != Ops.ASSIGN
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
-  @unittest.skipIf(Device.DEFAULT in {"CPU", "LLVM"}, "CPU does not support using a different type for accumulation")
+  @unittest.skipIf(Device.DEFAULT in {"CPU"}, "CPU does not support using a different type for accumulation")
   def test_tensor_cores_unroll_casted_phi_with_children(self):
     # all ASSIGN children are outside the loop
     tc = [tc for tc in Device[Device.DEFAULT].renderer.tensor_cores if tc.dtype_in != tc.dtype_out][0]
@@ -774,7 +774,7 @@ class TestFloat4(unittest.TestCase):
 
     assert TestFloat4.count_float4(program.uops) == (2, 1)
 
-  @unittest.skipIf(Device.DEFAULT in {"CPU", "LLVM"} and AMX, "CPU with AMX upcasts float up to size 16")
+  @unittest.skipIf(Device.DEFAULT in {"CPU"} and AMX, "CPU with AMX upcasts float up to size 16")
   def test_float4_multidim(self):
     a = Tensor.empty(2, 8).realize()
     b = Tensor.empty(2, 8).realize()
@@ -788,7 +788,7 @@ class TestFloat4(unittest.TestCase):
 
     assert TestFloat4.count_float4(uops) == (4, 2)
 
-  @unittest.skipUnless(Device.DEFAULT in {"CPU", "LLVM"} and AMX, "Only CPU with AMX upcasts float up to size 16")
+  @unittest.skipUnless(Device.DEFAULT in {"CPU"} and AMX, "Only CPU with AMX upcasts float up to size 16")
   def test_float4_multidim_amx(self):
     def kernel_for_shape(size, shift):
       a = Tensor.empty(2, size).realize()
@@ -822,7 +822,7 @@ class TestFloat4(unittest.TestCase):
 
     assert TestFloat4.count_float4(program.uops) == (0, 1)
 
-  @unittest.skipIf(Device.DEFAULT in {"CPU", "LLVM"} and AMX, "CPU with AMX upcasts float up to size 16")
+  @unittest.skipIf(Device.DEFAULT in {"CPU"} and AMX, "CPU with AMX upcasts float up to size 16")
   def test_float4_multidim_unaligned_load(self):
     a = Tensor.empty(2, 9).realize().shrink(((0, 2), (1, 9),))
     b = Tensor.empty(2, 9).realize().shrink(((0, 2), (1, 9),))
@@ -836,7 +836,7 @@ class TestFloat4(unittest.TestCase):
 
     assert TestFloat4.count_float4(uops) == (0, 2)
 
-  @unittest.skipUnless(Device.DEFAULT in {"CPU", "LLVM"} and AMX, "Only CPU with AMX upcasts float up to size 16")
+  @unittest.skipUnless(Device.DEFAULT in {"CPU"} and AMX, "Only CPU with AMX upcasts float up to size 16")
   def test_float4_multidim_unaligned_load_amx(self):
     def kernel_for_shape(size, shift):
       a = Tensor.empty(2, size).realize().shrink(((0, 2), (1, size),))
