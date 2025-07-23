@@ -666,7 +666,7 @@ jobs:
       AMD: 1
       MOCKGPU: 1
       FORWARD_ONLY: 1
-      AMD_LLVM: ${{ matrix.backend == 'amdllvm' && '1' || matrix.backend != 'amdllvm' && '0' }}
+      LLVM: ${{ matrix.backend == 'amdllvm' && '1' || matrix.backend != 'amdllvm' && '0' }}
       PYTHONPATH: ${{ github.workspace }}
     steps:
       - name: Checkout Code
