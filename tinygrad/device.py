@@ -10,7 +10,7 @@ from tinygrad.renderer import Renderer
 
 # **************** Device ****************
 
-ALL_DEVICES = ["METAL", "AMD", "NV", "CUDA", "QCOM", "GPU", "CPU", "LLVM", "DSP", "WEBGPU"]
+ALL_DEVICES = ["METAL", "AMD", "NV", "CUDA", "QCOM", "GPU", "CPU", "DSP", "WEBGPU"]
 class _Device:
   def __init__(self) -> None:
     self._devices = [x.stem[len("ops_"):].upper() for x in (pathlib.Path(__file__).parent/"runtime").iterdir() if x.stem.startswith("ops_")]
@@ -306,7 +306,7 @@ def is_dtype_supported(dtype:DType, device:str|None=None) -> bool:
   if dtype == dtypes.bfloat16:
     if device == "METAL": return not CI
     if device in {"CUDA", "NV"}: return not CI and not getenv("PTX")
-    if device in {"CPU", "LLVM"}: return not CI and platform.machine() in {"arm", "arm64", "aarch64", "x86_64", "amd64"}
+    if device == "CPU": return not CI and platform.machine() in {"arm", "arm64", "aarch64", "x86_64", "amd64"}
     return device == "AMD"
   if dtype in dtypes.fp8s:
     # not supported yet - in progress
@@ -320,7 +320,7 @@ def is_dtype_supported(dtype:DType, device:str|None=None) -> bool:
   if dtype == dtypes.half:
     if device == "GPU": return not CI and not OSX
     if device in ["CUDA", "NV"]: return not CI
-    if device == "LLVM": return OSX
+    if device == "CPU" and getenv("LLVM"): return OSX
     if device == "PYTHON": return sys.version_info >= (3, 12)
   if dtype == dtypes.float64: return device != "METAL" and not (OSX and device == "GPU")
   return True
