@@ -18,13 +18,13 @@ def check_assign(buffers:list[list[Buffer]|tuple[Buffer, ...]]):
   first_appearance, last_appearance = {}, {}
   for i,u in enumerate(buffers):
     for buf in u:
-      if buf.is_allocated() or buf.base.is_allocated() or buf.lb_refcount > 0: continue
+      if buf.is_allocated() or buf.base.is_allocated() or buf.uop_refcount > 0: continue
       if buf.base not in first_appearance: first_appearance[buf.base] = i
       last_appearance[buf.base] = i
 
   for i,u in enumerate(buffers):
     for buf in u:
-      if buf.is_allocated() or buf.base.is_allocated() or buf.lb_refcount > 0: continue
+      if buf.is_allocated() or buf.base.is_allocated() or buf.uop_refcount > 0: continue
       cur, base = assigned.get(buf, buf), assigned.get(buf.base, buf.base)
       if buf._base is not None:
         assert cur.base == base.base and cur.offset == buf.offset + base.offset, f"failed: {buf} {cur} {base} {buf.offset} {base.offset}"
@@ -117,6 +117,20 @@ class TestMemoryPlanner(unittest.TestCase):
       [b(11), b(3), b(2)],
       [b(12), b(5), b(4), b(3), b(2)],
       [b(13), b(6), b(12), b(7)],
+    ]
+    check_assign(bs)
+
+  def test_very_small_buffers(self):
+    bs = [
+      [b(0, pin=True), b(1, size=32)],
+      [b(3, size=4), b(4, size=6)],
+    ]
+    check_assign(bs)
+
+  def test_very_big_buffers(self):
+    bs = [
+      [b(0, pin=True), b(1, size=34359738368000)],
+      [b(3, size=1 << 128), b(4, size=1 << 64)],
     ]
     check_assign(bs)
 

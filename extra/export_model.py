@@ -4,13 +4,13 @@ from tinygrad.renderer import ProgramSpec
 from tinygrad.tensor import Device, Tensor
 from tinygrad.engine.jit import TinyJit
 from tinygrad.nn.state import get_state_dict
-from tinygrad.helpers import Context
+from tinygrad.helpers import Context, to_mv
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops
 import json
 from collections import OrderedDict
 
-EXPORT_SUPPORTED_DEVICE = ["WEBGPU", "CPU", "CUDA", "GPU"]
+EXPORT_SUPPORTED_DEVICE = ["WEBGPU", "CPU", "CUDA", "CL"]
 
 def compile_net(run:TinyJit, special_names:Dict[int,str]) -> Tuple[Dict[str,str],List[Tuple[str,List[str],List[int]]],Dict[str,Tuple[int,DType,int]],Dict[str,Tensor]]:
   functions, bufs, bufs_to_save, statements, bufnum = {}, {}, {}, [], 0
@@ -48,13 +48,13 @@ def jit_model(model, *args) -> Tuple[TinyJit,Dict[int,str]]:
 
   # hack to put the inputs back
   for (j,i),idx in run.input_replace.items():
-    realized_input = args[idx].lazydata.base.realized
+    realized_input = args[idx].uop.base.realized
     run.jit_cache[j].bufs[i] = realized_input
     special_names[id(realized_input)] = f'input{idx}'
 
   # TODO: fetch this from the jit in self.input_replace and self.ret (hint: use get_parameters on self.ret)
   for i, output in enumerate(the_output):
-    special_names[id(output.lazydata.base.realized)] = f'output{i}'
+    special_names[id(output.uop.base.realized)] = f'output{i}'
   return run, special_names
 
 def export_model_clang(functions:Dict[str,str], statements:Dict[str,Tuple[str,int,int]], bufs:Dict[str,Tuple[str,int,int]],
@@ -67,11 +67,12 @@ def export_model_clang(functions:Dict[str,str], statements:Dict[str,Tuple[str,in
   forward_args = ",".join(f"{dtype}{'*' if name not in symbolic_vars.values() else ''} {name}" for name,dtype,_ in (outputs+inputs if wasm else inputs+outputs))
 
   if not wasm:
+    thread_id = 0 # NOTE: export does not support threading, thread_id is always 0
     for name,cl in bufs_to_save.items():
-      weight = ''.join(["\\x%02X"%x for x in bytes(cl._buf)])
+      weight = ''.join(["\\x%02X"%x for x in bytes(to_mv(cl._buf.va_addr, cl._buf.size))])
       cprog.append(f"unsigned char {name}_data[] = \"{weight}\";")
     cprog += [f"{dtype_map[dtype]} {name}[{len}];" if name not in bufs_to_save else f"{dtype_map[dtype]} *{name} = ({dtype_map[dtype]} *){name}_data;" for name,(len,dtype,_key) in bufs.items() if name not in input_names+output_names]
-    cprog += [f"void net({forward_args}) {{"] + [f"{name}({', '.join(args)});" for (name, args, _global_size, _local_size) in statements] + ["}"]
+    cprog += [f"void net({forward_args}) {{"] + [f"{name}({', '.join(args)}, {thread_id});" for (name, args, _global_size, _local_size) in statements] + ["}"]
     return '\n'.join(headers + cprog)
   else:
     if bufs_to_save:
@@ -239,10 +240,12 @@ export default {model_name};
 
 def export_model(model, target:str, *inputs, model_name: Optional[str] = "model", stream_weights=False):
   assert Device.DEFAULT in EXPORT_SUPPORTED_DEVICE, f"only {', '.join(EXPORT_SUPPORTED_DEVICE)} are supported"
-  with Context(JIT=2): run,special_names = jit_model(model, *inputs)
+
+  # NOTE: CPU_COUNT=1, since export does not support threading
+  with Context(JIT=2, CPU_COUNT=1): run,special_names = jit_model(model, *inputs)
   functions, statements, bufs, bufs_to_save = compile_net(run, special_names)
   state = get_state_dict(model)
-  weight_names = {id(x.lazydata.base.realized): name for name, x in state.items()}
+  weight_names = {id(x.uop.base.realized): name for name, x in state.items()}
   input_names = [name for _,name in special_names.items() if "input" in name]
   output_names = [name for _,name in special_names.items() if "output" in name]
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # cd extra/disassemblers/ && git clone --recursive github.com:geohot/cuda_ioctl_sniffer.git
-# LD_PRELOAD=$PWD/extra/disassemblers/cuda_ioctl_sniffer/out/sniff.so GPU=1 python3 test/external/external_multi_gpu.py
+# LD_PRELOAD=$PWD/extra/disassemblers/cuda_ioctl_sniffer/out/sniff.so CL=1 python3 test/external/external_multi_gpu.py
 import numpy as np
 from tinygrad.tensor import Tensor
 from tinygrad.helpers import colored, Timing, getenv
@@ -21,8 +21,8 @@ if __name__ == "__main__":
   with Timing("CPU creation: ", on_exit=lambda x: f", {(sz*4*2)/x:.2f} GB/sec"):
     c0 = (Tensor.ones(sz, device="CPU")/2).realize()
     c1 = (Tensor.ones(sz, device="CPU")/4).realize()
-    print(c0.lazydata.base.realized)
-    print(c1.lazydata.base.realized)
+    print(c0.uop.base.realized)
+    print(c1.uop.base.realized)
 
   with Timing("CPU -> 0: ", on_exit=lambda x: f", {(sz*4)/x:.2f} GB/sec"):
     a0 = c0.to(d0).realize()

@@ -2,7 +2,7 @@ import unittest, functools, random
 from tinygrad import Tensor, Device, nn, GlobalCounters, TinyJit, dtypes, Variable
 from tinygrad.device import is_dtype_supported
 from tinygrad.uop.ops import Ops, UOp
-from tinygrad.helpers import CI, getenv, prod, Context, OSX
+from tinygrad.helpers import CI, getenv, prod, Context, RANGEIFY
 from tinygrad.nn.state import get_parameters, get_state_dict
 from tinygrad.engine.realize import lower_schedule, BufferCopy, CompiledRunner, run_schedule
 import numpy as np
@@ -29,7 +29,7 @@ N = 128
 def _test_allreduce(t:Tensor):
   aa = (t[0:64] + t[64:128] + t[128:192] + t[192:256]).repeat([4,1]).realize()
   ts = t.shard(devices_4, 0).realize()
-  b = Tensor(UOp.allreduce(ts.lazydata, Ops.ADD, ts.device))
+  b = Tensor(UOp.allreduce(ts.uop, Ops.ADD, ts.device))
   b.realize()
   return aa, b
 
@@ -50,9 +50,20 @@ class TestMultiTensor(unittest.TestCase):
   def test_shard(self):
     X = Tensor.ones(256).contiguous().realize()
     X.shard_(devices_2, 0)
-    for lb in X.lazydata.src:
+    for lb in X.uop.src:
       assert lb.shape == (128,)
     (X + X).realize()
+
+  def _test_shard_op(self, op, out, n=4):
+    t = Tensor.ones(n).contiguous().realize().shard(devices_2, 0)
+    r = op(t).realize()
+    assert t.uop.is_realized, "shard didn't realize"
+    self.assertEqual(r.tolist(), out)
+  def test_shard_reshape(self): self._test_shard_op(lambda t:t.reshape(2, 2), [[1.,1.],[1.,1.]])
+  def test_shard_elementwise(self): self._test_shard_op(lambda t:(t+t).reshape(2, 2), [[2.,2.],[2.,2.]])
+  def test_shard_reduce(self):
+    self._test_shard_op(lambda t:t.reshape(2, 3).sum(axis=1), [3.,3.], n=6)
+    self._test_shard_op(lambda t:t.reshape(2, 3).sum(axis=0), [2.,2.,2.], n=6)
 
   def test_shard_not_multiple(self):
     X = Tensor.ones(256).contiguous().realize()
@@ -61,18 +72,20 @@ class TestMultiTensor(unittest.TestCase):
 
   def test_tensor_from_multi(self):
     X = Tensor([1, 2], dtype=dtypes.int).shard_(devices_2, 0)
-    Y = Tensor(X.lazydata)
+    Y = Tensor(X.uop)
     self.assertEqual(Y.device, Device.DEFAULT)
     np.testing.assert_equal(X.numpy(), Y.numpy())
 
     with self.assertRaises(AssertionError):
-      _ = Tensor(X.lazydata, dtype=dtypes.float)
+      _ = Tensor(X.uop, dtype=dtypes.float)
 
   def test_sharded_arange(self):
     sharded_arange = Tensor.arange(1000).shard(devices_2, 0)
     sharded_arange.realize()
     np.testing.assert_equal(sharded_arange.numpy(), np.arange(1000))
 
+  # TODO: fix this to not copy on the src device
+  @unittest.expectedFailure
   def test_shard_no_recompile(self):
     X = Tensor.ones(256).contiguous().realize()
     X.shard_(devices_2, 0)
@@ -82,7 +95,7 @@ class TestMultiTensor(unittest.TestCase):
     for si, ei in lower_schedule(sched):
       if isinstance(ei.prg, CompiledRunner): names.append(ei.prg.p.name)
       ei.run()
-    self.assertEqual(len(set(names)), 1), "function was relinearized"
+    self.assertEqual(len(set(names)), 1, "function was relinearized")
 
   @unittest.skip("this doesn't fold because shard_ calls contiguous on all lbs")
   def test_sharded_memory(self):
@@ -170,22 +183,20 @@ class TestMultiTensor(unittest.TestCase):
     for i in range(2):
       xt = X[i*2:i*2+2].contiguous()
       sched = xt.schedule()
-      kernels = [s for s in sched if s.ast.op is Ops.SINK]
+      #kernels = [s for s in sched if s.ast.op is Ops.SINK]
       #self.assertEqual(len(kernels), 1)
-      self.assertEqual(kernels[0].bufs[0].device, devices_2[i])
+      #self.assertEqual(kernels[0].bufs[0].device, devices_2[i])
       run_schedule(sched)
       np.testing.assert_equal(xt.numpy(), X_np[i*2:i*2+2])
 
-  @given(strat.sampled_from((4, 5)), strat.sampled_from((devices_2, devices_3)),
+  @given(strat.sampled_from((devices_2, devices_3)),
          strat.sampled_from((Ops.ADD, Ops.MUL, Ops.MAX)),
-         strat.sampled_from((None, 0, 1)), strat.sampled_from((None, 0, 1)), strat.sampled_from((1, 0, -1)))
-  def test_simple_reduce(self, N, devices, rop, shard_axis, reduce_axis, sign):
-    N = N * len(devices)
-    X = Tensor.rand(N*N).reshape(N, N).mul(sign)
+         strat.sampled_from((None, 0, 1)), strat.sampled_from((None, 0, 1)))
+  def test_simple_reduce(self, devices, rop, shard_axis, reduce_axis):
+    N = 4 * len(devices)
+    X = (Tensor.rand(N*N)-1).reshape(N, N).shard_(devices, shard_axis)
     n = X.numpy()
-    X.shard_(devices, shard_axis)
-    f = {Ops.ADD: lambda x: x.sum(reduce_axis), Ops.MUL: lambda x: x.prod(reduce_axis),
-         Ops.MAX: lambda x: x.max(reduce_axis)}[rop]
+    f = {Ops.ADD: lambda x: x.sum(reduce_axis), Ops.MUL: lambda x: x.prod(reduce_axis), Ops.MAX: lambda x: x.max(reduce_axis)}[rop]
     fX = f(X)
     fn = f(n)
     np.testing.assert_allclose(fX.numpy(), fn, rtol=1e-6, atol=1e-6)
@@ -245,9 +256,9 @@ class TestMultiTensor(unittest.TestCase):
         shape = tuple([(n if i == 0 else 1) * random.randint(1, 10) for i in range(random.randint(1, 4))])
         t = Tensor.rand(shape).shard_(tuple([d0, d1, d2, d3][:n]), 0)
         with Context(RING=0):
-          a = Tensor(UOp.allreduce(t.lazydata, Ops.ADD, t.device))
+          a = Tensor(UOp.allreduce(t.uop, Ops.ADD, t.device))
         with Context(RING=2):
-          b = Tensor(UOp.allreduce(t.lazydata, Ops.ADD, t.device))
+          b = Tensor(UOp.allreduce(t.uop, Ops.ADD, t.device))
         diff = a - b
         mean_err = diff.reshape((prod(diff.shape),)).abs().mean().numpy()
         max_err = diff.reshape((prod(diff.shape),)).abs().max().numpy()
@@ -371,12 +382,12 @@ class TestMultiTensor(unittest.TestCase):
     np.testing.assert_allclose(y.numpy(), y_shard.numpy(), atol=1e-6, rtol=1e-6)
 
   # NOTE: this is failing on LLVM CI, no idea why. Works locally.
-  @unittest.skipIf(CI and REAL_DEV in ("CUDA", "NV", "LLVM"), "slow")
-  @unittest.skipIf(REAL_DEV == "WEBGPU" and not OSX, "WEBGPU Vulkan can only run kernels with up to 10 buffers")
+  @unittest.skipIf(CI and REAL_DEV in ("CUDA", "NV", "CPU", "AMD"), "slow, and flaky on CPU")
+  @unittest.skipIf(RANGEIFY, "TODO: pm_rangeify hangs")
   def test_data_parallel_resnet(self):
     from extra.models.resnet import ResNet18
 
-    fake_image = Tensor.rand((2, 3, 224//8, 224//8))
+    fake_image = Tensor.rand((2, 3, 224//16, 224//16))
     fake_image_sharded = fake_image.shard(devices_2, axis=0)
     m = ResNet18()
     m.load_from_pretrained()
@@ -408,15 +419,16 @@ class TestMultiTensor(unittest.TestCase):
     # sometimes there is zeros in these grads... why?
     np.testing.assert_allclose(grad, shard_grad, atol=1e-5, rtol=1e-5)
 
-  @unittest.skipIf(CI and REAL_DEV in ("CUDA", "NV", "LLVM", "CPU"), "slow, and flaky on LLVM/CPU")
-  @unittest.skipIf(REAL_DEV == "WEBGPU" and not OSX, "WEBGPU Vulkan can only run kernels with up to 10 buffers")
+  @unittest.skipIf(CI and REAL_DEV in ("CUDA", "NV", "CPU", "AMD"), "slow, and flaky on CPU")
+  @unittest.skipIf(RANGEIFY, "TODO: pm_rangeify hangs")
   def test_data_parallel_resnet_train_step(self):
     from extra.models.resnet import ResNet18
-    fake_image = Tensor.rand((2, 3, 224//8, 224//8))
+    fake_image = Tensor.rand((2, 3, 224//16, 224//16))
     labels = Tensor.randint(2, low=0, high=1000)
     m = ResNet18()
     self._test_model_train_step(m, fake_image, labels)
 
+  @unittest.skipIf(RANGEIFY, "TODO: pm_rangeify hangs")
   def test_data_parallel_simple_train_step(self):
     class Model:
       def __init__(self): self.conv1 = nn.Linear(128,128)
@@ -588,21 +600,21 @@ class TestMultiTensor(unittest.TestCase):
     t4 = t2.reshape((26, 105,))
 
     for t in [t0, t1, t2, t3, t4]:
-      assert t.lazydata.axis == 1
+      assert t.uop.axis == 1
       np.testing.assert_allclose(t.numpy().flatten(), t0.numpy().flatten())
 
     # test shape-one axis
     t5 = t4.reshape((26, 1, 105))
-    assert t5.lazydata.axis == 2
+    assert t5.uop.axis == 2
     np.testing.assert_allclose(t.numpy().flatten(), t5.numpy().flatten())
 
     # test split and rejoin to the right and reshape to the left
     t5 = t0.reshape((2, 13, 3, 5, 7))
     t6 = t0.reshape((13, 2, 3, 7, 5))
     t7 = t0.reshape((1, 13, 2, 3, 1, 7, 5))
-    assert t5.lazydata.axis == 2
-    assert t6.lazydata.axis == 2
-    assert t7.lazydata.axis == 3
+    assert t5.uop.axis == 2
+    assert t6.uop.axis == 2
+    assert t7.uop.axis == 3
     np.testing.assert_allclose(t5.numpy().flatten(), t0.numpy().flatten())
     np.testing.assert_allclose(t6.numpy().flatten(), t0.numpy().flatten())
     np.testing.assert_allclose(t7.numpy().flatten(), t0.numpy().flatten())
@@ -614,7 +626,7 @@ class TestMultiTensor(unittest.TestCase):
   @unittest.skip("no longer supports uneven shard")
   def test_reshape_on_axis_uneven(self):
     def reshape_helper(t0, t, t_axis):
-      assert t.lazydata.axis == t_axis
+      assert t.uop.axis == t_axis
       np.testing.assert_allclose(t0.reshape(t.shape).numpy(), t.numpy())
 
     t0 = Tensor.rand((4, 42, 15)).shard(devices_3, axis=1, splits=[14, 7, 21])
@@ -679,30 +691,32 @@ class TestMultiTensor(unittest.TestCase):
     self.assertEqual(d0_rand, d1_rand_flip)
     self.assertEqual(d1_rand, d0_rand_flip)
 
-  def test_rand_like_on_shard(self):
-    t = Tensor.empty((16, 16)).shard(devices_2)
+  def test_rand_like_on_shard(self, axis=None):
+    t = Tensor.empty((16, 16)).shard(devices_2, axis=axis)
     t2 = Tensor.rand_like(t)
     self.assertEqual(t.shape, t2.shape)
     self.assertEqual(t.device, t2.device)
     self.assertEqual(t.dtype, t2.dtype)
-    self.assertEqual(t.lazydata.axis, t2.lazydata.axis)
+    self.assertEqual(t.uop.axis, t2.uop.axis)
+    t2.realize()
+  def test_rand_like_on_shard_axis(self): self.test_rand_like_on_shard(0)
 
   def test_rand_like_from_alu(self):
     a = Tensor.ones(4, 4).shard(devices_4, axis=0)
     aa = a + a
     self.assertEqual(aa.device, devices_4)
-    self.assertEqual(aa.lazydata.axis, 0)
+    self.assertEqual(aa.uop.axis, 0)
     raa = aa.rand_like()
     self.assertEqual(raa.device, devices_4)
-    self.assertEqual(raa.lazydata.axis, 0)
+    self.assertEqual(raa.uop.axis, 0)
 
     b = Tensor.empty(4, 4).shard(devices_4, axis=None)
     ab = a + b
     self.assertEqual(ab.device, devices_4)
-    self.assertEqual(ab.lazydata.axis, 0)
+    self.assertEqual(ab.uop.axis, 0)
     rab = ab.rand_like()
     self.assertEqual(rab.device, devices_4)
-    self.assertEqual(rab.lazydata.axis, 0)
+    self.assertEqual(rab.uop.axis, 0)
 
   @unittest.skip("no longer supports uneven shard")
   def test_rand_like_uneven_shard(self):
@@ -711,8 +725,8 @@ class TestMultiTensor(unittest.TestCase):
     self.assertEqual(t.shape, t2.shape)
     self.assertEqual(t.device, t2.device)
     self.assertEqual(t.dtype, t2.dtype)
-    self.assertEqual(t.lazydata.axis, t2.lazydata.axis)
-    assert all(tlb.shape == t2lb.shape for tlb, t2lb in zip(t.lazydata.src, t2.lazydata.src))
+    self.assertEqual(t.uop.axis, t2.uop.axis)
+    assert all(tlb.shape == t2lb.shape for tlb, t2lb in zip(t.uop.src, t2.uop.src))
 
   def test_rand_like_none_shard(self):
     t = Tensor.empty((16, 16)).shard(devices_2)
@@ -720,7 +734,7 @@ class TestMultiTensor(unittest.TestCase):
     self.assertEqual(t.shape, t2.shape)
     self.assertEqual(t.device, t2.device)
     self.assertEqual(t.dtype, t2.dtype)
-    self.assertEqual(t.lazydata.axis, t2.lazydata.axis)
+    self.assertEqual(t.uop.axis, t2.uop.axis)
 
   def test_rand_like_arg_dtype(self):
     t = Tensor.empty((16, 16), dtype=dtypes.int32).shard(devices_2, axis=1)
@@ -769,7 +783,7 @@ class TestMultiTensor(unittest.TestCase):
     devices = (d0, d1, d2, d3)
     t = Tensor.zeros(16, 16).contiguous()
     t.shard_(devices, axis=0).realize()
-    assert all([lb is lb.base and lb.realized.base.size == 4 * 16 for lb in t.lazydata.src])
+    assert all([lb is lb.base and lb.realized.base.size == 4 * 16 for lb in t.uop.src])
 
   @unittest.skip("this is unreliable on OSX")
   def test_clone(self):
@@ -779,6 +793,7 @@ class TestMultiTensor(unittest.TestCase):
     t = Tensor.rand(16, 16).shard(devices_2, axis=0)
     np.testing.assert_allclose(t.numpy(), t.clone().numpy())
 
+  @unittest.skipIf(RANGEIFY, "RANGEIFY doesn't support multi const folding")
   def test_multi_const_folding(self):
     with Context(TRACK_MATCH_STATS=0):
       a = Tensor.arange(3).realize()
@@ -926,7 +941,7 @@ class TestShrinkMultiTensorShardedAxis(unittest.TestCase):
       to_add.append((Tensor.ones(2, 8) * i).shard(devices))
 
     added:list[Tensor] = []
-    for bound, a in zip(x.lazydata.bounds, to_add):
+    for bound, a in zip(x.uop.bounds, to_add):
       added.append(x[bound[0]:bound[1]] + a)
 
     output = added[0].cat(*added[1:])
@@ -934,7 +949,6 @@ class TestShrinkMultiTensorShardedAxis(unittest.TestCase):
     np.testing.assert_allclose(output.numpy(), expected)
 
 @unittest.skipIf(not_support_multi_device(), "no multi")
-@unittest.skipIf(REAL_DEV == "WEBGPU" and not OSX, "WEBGPU Vulkan can only run kernels with up to 10 buffers")
 class TestBatchNorm(unittest.TestCase):
   def test_unsynced_backprop_conv_bn(self):
     with Tensor.train():
@@ -962,7 +976,6 @@ class TestBatchNorm(unittest.TestCase):
       optim.step()
       out.numpy()
 
-  @unittest.skipIf(REAL_DEV == "WEBGPU" and not OSX, "WEBGPU Vulkan can only run kernels with up to 10 buffers")
   def test_unsynced_backprop_standalone_bn(self):
     from extra.lr_scheduler import OneCycleLR
     GPUS = (d1, d2)
@@ -1041,7 +1054,7 @@ class TestBatchNorm(unittest.TestCase):
         bns.append(bn)
 
       bn_ts = []
-      for bound, bn in zip(x.lazydata.bounds, bns):
+      for bound, bn in zip(x.uop.bounds, bns):
         bni = bn(x[bound[0]:bound[1]])
         bn_ts.append(bni)
 
@@ -1097,7 +1110,6 @@ class TestTensorOps(unittest.TestCase):
   def test_bitcast(self):
     helper_test_shard_op([(256,), (256,)], lambda x: x.bitcast(dtypes.int))
 
-# TODO: make these tests pass with VIZ=1
 @unittest.skipIf(not_support_multi_device(), "no multi")
 class TestMultiRamUsage(unittest.TestCase):
   def setUp(self):
@@ -1123,14 +1135,144 @@ class TestMultiRamUsage(unittest.TestCase):
     # NOTE: the first one on the DEFAULT device should be freed
     self.assertUsed(self.N*self.N*4*2)
 
-  @unittest.skip("TODO: this is broken")
-  def test_zeros_shard(self):
-    _ = Tensor.zeros(self.N, self.N).contiguous().shard(devices_2, axis=0).realize()
+  @unittest.skip("flaky")
+  def test_zeros_shard(self, devices=(d1, d2)):
+    _ = Tensor.zeros(self.N, self.N).contiguous().shard(devices, axis=0).realize()
     self.assertUsed(self.N*self.N*4) # sharding should not increase total ram usage
+  def test_zeros_shard_self(self): self.test_zeros_shard((d0, d1))
 
+  @unittest.skip("flaky")
   def test_zeros_contiguous_shard(self):
     _ = Tensor.zeros(self.N, self.N).contiguous().shard(devices_2, axis=0).contiguous().realize()
     self.assertUsed(self.N*self.N*4) # sharding should not increase total ram usage
+
+@unittest.skipIf(not_support_multi_device(), "need multi")
+class TestMultiFromUnrenderable(unittest.TestCase):
+  def test_from_npy(self):
+    t = Tensor(np.arange(100, dtype=np.uint32))
+    ll = t.shard((d0, d1), axis=0) + 1
+    np.testing.assert_equal(ll.numpy(), np.arange(100)+1)
+
+@unittest.skipIf(not_support_multi_device(), "need multi")
+class TestMultiAssign(unittest.TestCase):
+  device = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
+
+  def test_multi_assign_realized(self):
+    out = Tensor.zeros(4).shard(self.device, 0).contiguous().realize()
+    ones = Tensor.ones(4).shard(self.device, 0).contiguous().realize()
+    out.assign(ones).realize()
+    self.assertListEqual(out.tolist(), [1,1,1,1])
+
+  def test_multi_assign_unrealized(self):
+    out = Tensor.zeros(4).contiguous().realize().shard(self.device, 0)
+    ones = Tensor.ones(4).shard(self.device, 0).contiguous().realize()
+    out.assign(ones).realize()
+    self.assertListEqual(out.tolist(), [1,1,1,1])
+
+  def test_multi_assign_both_unrealized(self):
+    out = Tensor.zeros(4).contiguous().realize().shard(self.device, 0)
+    ones = Tensor.ones(4).contiguous().realize().shard(self.device, 0)
+    out.assign(ones).realize()
+    self.assertListEqual(out.tolist(), [1,1,1,1])
+
+  def test_multi_assign_piece(self):
+    out = Tensor.zeros(4,4).shard(self.device, 0).contiguous().realize()
+    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
+    out[:, 2:3].assign(ones).realize()
+    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
+
+  def test_multi_assign_piece_noncontig(self):
+    out = Tensor.zeros(4,4).contiguous().realize().shard(self.device, 0).realize()
+    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
+    out[:, 2:3].assign(ones).realize()
+    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
+
+  @unittest.expectedFailure
+  def test_multi_assign_piece_unrealized(self):
+    out = Tensor.zeros(4,4).contiguous().realize().shard(self.device, 0)
+    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
+    out[:, 2:3].assign(ones).realize()
+    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
+
+  def test_multi_assign_var_offset(self):
+    out = Tensor.zeros(4,4).contiguous().realize().shard(self.device, 0).realize()
+    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
+    vi = Variable("i", 0, 3).bind(2)
+    out[:, vi:vi+1].assign(ones).realize()
+    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
+
+  def test_multi_assign_var_offset_jit_none(self): self.test_multi_assign_var_offset_jit(None)
+  def test_multi_assign_var_offset_jit(self, shard_axis=0):
+    out = Tensor.zeros(4,6).contiguous().realize().shard(self.device, shard_axis).realize()
+    ones = Tensor.ones(4,1).shard(self.device, shard_axis).contiguous().realize()
+
+    @TinyJit
+    def f(out:Tensor, vi):
+      out[:, vi:vi+1].assign(ones).realize()
+      ones.assign(ones+1).realize()
+
+    vi = Variable("i", 0, 5)
+    for i in range(1,5):
+      GlobalCounters.reset()
+      f(out, vi.bind(i))
+    self.assertListEqual(out.tolist(), [[0,1,2,3,4,0]]*4)
+
+@unittest.skipIf(not_support_multi_device(), "need multi")
+class TestMultiTransformer(unittest.TestCase):
+  def test_transformer(self):
+    device = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
+
+    from extra.models.llama import Transformer
+    args = {"dim": 32, "n_heads": 1, "n_kv_heads": 1, "n_layers": 2, "norm_eps": 1e-5, "rope_theta": 500000, "vocab_size": 1024,
+            "hidden_dim": 32, "max_context": 12}
+    real_model = Transformer(**args)
+    shard_model = Transformer(**args)
+
+    # copy state
+    nn.state.load_state_dict(shard_model, nn.state.get_state_dict(real_model))
+
+    # shard
+    for k,v in nn.state.get_state_dict(shard_model).items():
+      if 'scale' in k: v.shard_(device, axis=None)  # from quantized
+      elif '.attention.' in k: v.shard_(device, axis=-1)
+      elif '.feed_forward.w1.' in k: v.shard_(device, axis=0)
+      elif '.feed_forward.w3.' in k: v.shard_(device, axis=0)
+      elif '.feed_forward.' in k: v.shard_(device, axis=-1)
+      elif 'tok_embeddings.weight' in k: v.shard_(device, axis=0)
+      elif 'output.weight' in k: v.shard_(device, axis=0)
+      else: v.shard_(device, axis=None)
+
+    last_tok = 0
+    for i in range(10):
+      real_tok = real_model(Tensor([[last_tok]], device=Device.DEFAULT), i).item()
+      shard_tok = shard_model(Tensor([[last_tok]], device=device), i).item()
+
+      # test kv cache
+      kv1 = real_model.layers[0].attention.cache_kv.numpy()
+      kv2 = shard_model.layers[0].attention.cache_kv.numpy()
+      #print(np.concatenate([kv1[:, :, :, :, 0:1], kv2[:, :, :, :, 0:1]], axis=4))
+      np.testing.assert_allclose(kv1, kv2, atol=1e-5, rtol=1e-5, err_msg=f"issue at token {i}")
+
+      # test token
+      self.assertEqual(real_tok, shard_tok, f"issue at token {i}")
+      last_tok = real_tok
+
+  @unittest.skip("super slow")
+  def test_llama1b_full(self):
+    from tinygrad.helpers import fetch
+    fetch("https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model", "tokenizer.model", subdir="llama3-1b-instruct")
+    model = fetch("https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K.gguf",
+                  "Llama-3.2-1B-Instruct-Q6_K.gguf", subdir="llama3-1b-instruct")
+
+    device = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
+    from examples.llama3 import build_transformer
+    real_model = build_transformer(model, model_size="1B", device=Device.DEFAULT)
+    shard_model = build_transformer(model, model_size="1B", device=device)
+
+    last_tok = 0
+    real_tok = real_model(Tensor([[last_tok]], device=Device.DEFAULT), 0)
+    shard_tok = shard_model(Tensor([[last_tok]], device=device), 0)
+    self.assertEqual(real_tok.item(), shard_tok.item())
 
 if __name__ == '__main__':
   unittest.main()

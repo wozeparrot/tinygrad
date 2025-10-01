@@ -240,7 +240,6 @@ class LLaMa:
             #elif k.endswith('.weight'): v.shard_(device, axis=-1)
             #elif 'norm.' in k: v.shard_(device, axis=-1)
             else: v.shard_(device, axis=None)
-            #print(k, v.shape, v.lazydata.axis)
 
         # replace weights in model
         load_state_dict(model, weights, strict=False, consume=True)
@@ -446,7 +445,7 @@ After you are done speaking, output [EOS]. You are not Chad.
   print(f"using LLaMA{LLAMA_SUFFIX}-{args.size} model")
   device = tuple(f"{Device.DEFAULT}:{i}" for i in range(args.shard)) if args.shard > 1 else Device.DEFAULT
   llama = LLaMa.build(MODEL_PATH, TOKENIZER_PATH, model_gen=args.gen, model_size=args.size, quantize=args.quantize, device=device)
-  param_bytes = sum(x.lazydata.size * x.dtype.itemsize for x in get_parameters(llama.model))
+  param_bytes = sum(x.uop.size * x.dtype.itemsize for x in get_parameters(llama.model))
 
   outputted = pre_prompt if chatbot else args.prompt
   start_pos, toks = 0, [llama.tokenizer.bos_id()] + llama.tokenizer.encode(outputted)
@@ -479,7 +478,7 @@ After you are done speaking, output [EOS]. You are not Chad.
       with Profiling(enabled=args.profile):
         with Timing("total ", enabled=args.timing, on_exit=lambda x: f", {1e9/x:.2f} tok/s, {GlobalCounters.global_mem/x:.2f} GB/s, param {param_bytes/x:.2f} GB/s"):
           with WallTimeEvent(BenchEvent.STEP):
-            with Timing("enqueue in ", on_exit=(lambda et: (f", {(GlobalCounters.time_sum_s-st)*1e3:.2f} ms on GPU" if DEBUG>=2 else "")+
+            with Timing("enqueue in ", on_exit=(lambda et: (f", {(GlobalCounters.time_sum_s-st)*1e3:.2f} ms on {Device.DEFAULT}" if DEBUG>=2 else "")+
                         f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
                         (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s, param {param_bytes*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None, enabled=args.timing):
               tok_tensor = llama.model(next_tok, start_pos, args.temperature)

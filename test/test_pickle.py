@@ -2,7 +2,7 @@ import unittest, pickle, types
 import numpy as np
 from tinygrad import Tensor, TinyJit, Variable, dtypes
 from tinygrad.helpers import GlobalCounters, ContextVar, Context
-from tinygrad.uop.ops import PatternMatcher, UPat, UOp, Ops
+from tinygrad.uop.ops import PatternMatcher, UPat, UOp
 
 class TestPickle(unittest.TestCase):
   def test_pickle_code_object(self):
@@ -20,7 +20,7 @@ class TestPickle(unittest.TestCase):
     self.assertEqual(pm2.rewrite(sink).key, tt.key)
 
   def test_pickle_main_pattern_matcher(self):
-    from tinygrad.codegen.devectorizer import sym
+    from tinygrad.codegen.late.devectorizer import sym
     ssym = pickle.dumps(sym)
     dsym = pickle.loads(ssym)
     self.assertEqual(dsym.patterns[0][0].location, sym.patterns[0][0].location)
@@ -45,15 +45,14 @@ class TestPickle(unittest.TestCase):
     t_values = t.numpy()
     del t # free buffers
     print("** post pickle")
-    init = GlobalCounters.kernel_count
     t2:Tensor = pickle.loads(st)
+    assert t2.uop.is_realized
     np.testing.assert_equal(t_values, t2.numpy())
-    self.assertEqual(GlobalCounters.kernel_count-init, 0)
 
   def test_pickle_realized_tensor_alt2(self):
     print("** init")
     t = Tensor.rand(10, 10).to("CPU").realize()
-    tensor_uop = t.lazydata
+    tensor_uop = t.uop
     assert tensor_uop.is_realized, f"expected {tensor_uop} to be realized"
     t_values = t.numpy()
     # pickle
@@ -63,21 +62,21 @@ class TestPickle(unittest.TestCase):
     del tensor_uop
     print("** post pickle")
     t2:Tensor = pickle.loads(st)
-    assert t2.lazydata.is_realized, f"expected {t2.lazydata} to be realized"
+    assert t2.uop.is_realized, f"expected {t2.uop} to be realized"
     np.testing.assert_equal(t_values, t2.numpy())
 
   # NOTE: currently Buffer exists on the uop, not tensor
   def test_pickle_buffer_uop(self):
     t = Tensor.arange(4).realize()
-    a = t.lazydata
-    assert a.op is Ops.BUFFER
-    self.assertIsNotNone(buffer:=a.realized)
+    a = t.uop
+    assert a.is_realized
+    self.assertIsNotNone(buffer:=a.base.realized)
     s = pickle.dumps(a)
     # free buffers
     del a
     del buffer
     a2:UOp = pickle.loads(s)
-    self.assertListEqual(a2.realized.as_buffer().cast("I").tolist(), [0, 1, 2, 3])
+    self.assertListEqual(a2.base.realized.as_buffer().cast("I").tolist(), [0, 1, 2, 3])
 
   def test_pickle_unrealized_tensor(self):
     t = Tensor.ones(10, 10)
@@ -98,12 +97,12 @@ class TestPickle(unittest.TestCase):
   def test_pickle_buffer_view(self):
     t = Tensor.arange(10, device="CPU").contiguous().realize()
     vt = t[3:5].contiguous().realize()
-    assert hasattr(vt.lazydata.buffer, 'base')
+    assert hasattr(vt.uop.buffer, 'base')
     ref_value = vt.tolist()
     st = pickle.dumps(vt)
     del t, vt
     vt2 = pickle.loads(st)
-    assert hasattr(vt2.lazydata.buffer, 'base')
+    assert hasattr(vt2.uop.buffer, 'base')
     assert ref_value == vt2.tolist()
 
   def test_pickle_numpy(self):

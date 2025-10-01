@@ -35,6 +35,7 @@ Elementwise ops operate on a per element basis. They don't change the shape of t
 
 ::: tinygrad.Tensor.relu
 ::: tinygrad.Tensor.sigmoid
+::: tinygrad.Tensor.logsigmoid
 ::: tinygrad.Tensor.hardsigmoid
 ::: tinygrad.Tensor.elu
 ::: tinygrad.Tensor.celu
@@ -77,6 +78,7 @@ Elementwise ops operate on a per element basis. They don't change the shape of t
 ::: tinygrad.Tensor.minimum
 ::: tinygrad.Tensor.where
 ::: tinygrad.Tensor.copysign
+::: tinygrad.Tensor.logaddexp
 
 ## Casting Ops
 

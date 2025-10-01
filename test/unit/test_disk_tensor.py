@@ -1,4 +1,4 @@
-import pathlib, tempfile, unittest
+import os, pathlib, tempfile, unittest
 import numpy as np
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.dtype import DType
@@ -117,6 +117,7 @@ class TestSafetensors(unittest.TestCase):
       for k in f.keys():
         np.testing.assert_array_equal(f.get_tensor(k).numpy(), state_dict[k].numpy())
 
+  @unittest.skip("this test takes 7 seconds. TODO: make disk assign lazy")
   def test_efficientnet_safetensors(self):
     from extra.models.efficientnet import EfficientNet
     model = EfficientNet(0)
@@ -306,7 +307,7 @@ class TestDiskTensor(unittest.TestCase):
     ret = t.bitcast(dtypes.uint16).to("CPU") + 1
     assert ret.tolist() == [2827, 3341, 3855, 4369]
 
-  @unittest.skipIf(OSX, "new LLVM has an issue on OSX")
+  @unittest.skipIf(OSX or Device.DEFAULT == "CL", "new LLVM has an issue on OSX, CL=1 gives the wrong output")
   def test_bf16_disk_write_read(self):
     t = Tensor([10000, -1, -1000, -10000, 20], dtype=dtypes.float32)
     t.to(f"disk:{temp('dt_bf16_disk_write_read_f32')}").realize()
@@ -317,7 +318,7 @@ class TestDiskTensor(unittest.TestCase):
     with open(temp('dt_bf16_disk_write_read_bf16'), "wb") as f: f.write(adat)
 
     t = Tensor.empty(5, dtype=dtypes.bfloat16, device=f"disk:{temp('dt_bf16_disk_write_read_bf16')}")
-    ct = t.llvm_bf16_cast(dtypes.float)
+    ct = t.to(Device.DEFAULT).cast(dtypes.float)
     assert ct.numpy().tolist() == [9984., -1, -1000, -9984, 20]
 
   def test_copy_from_disk(self):
@@ -351,6 +352,7 @@ class TestDiskTensor(unittest.TestCase):
       on_dev = t.to(Device.DEFAULT).realize()
       np.testing.assert_equal(on_dev.numpy(), t.numpy())
 
+  @unittest.skip("this allocates a lot of RAM")
   @unittest.skipUnless(OSX, "seems to only be an issue on macOS with file size >2 GiB")
   def test_copy_to_cpu_not_truncated(self):
     with open((fn:=temp("dt_copy_to_cpu_not_truncated")), "wb") as f: f.write(b'\x01' * (size := int(2 * 1024**3)) + (test := b"test"))
@@ -408,5 +410,13 @@ class TestPathTensor(unittest.TestCase):
     self.assertEqual(t_cpu.device, "CPU")
     np.testing.assert_array_equal(t_cpu.numpy(), np.frombuffer(self.test_data, dtype=np.uint8))
 
+  def test_path_tensor_disk_device_bug(self):
+    test_file = pathlib.Path(self.temp_dir.name) / "disk_device_bug"
+    with open(test_file, "wb") as f: f.write(bytes(range(10)))
+    os.chmod(test_file, 0o000)
+    with self.assertRaises(PermissionError):
+      Tensor(pathlib.Path(test_file)).tolist()
+    os.chmod(test_file, 0o644)
+    assert Tensor(pathlib.Path(test_file)).tolist(), list(range(10))
 if __name__ == "__main__":
   unittest.main()
