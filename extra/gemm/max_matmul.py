@@ -4,6 +4,8 @@ from tinygrad import dtypes
 from tinygrad.dtype import DTYPES_DICT
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# problem variations
 DTYPE_IN = DTYPES_DICT[getenv("DTYPE_IN", "half")]
 DTYPE_OUT = DTYPES_DICT[getenv("DTYPE_OUT", "half")]
 DTYPE_ACC = DTYPES_DICT[getenv("DTYPE_ACC", "float")]
@@ -55,11 +57,9 @@ if __name__ == "__main__":
     b = cudaalloc.alloc(K*N*DTYPE_IN.itemsize)
     c = cudaalloc.alloc(M*N*DTYPE_OUT.itemsize)
 
-    if GEMM_VARIATION == "max" and (M%64)==0 and (N%128)==0 and (K%64)==0 and \
-       DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.float and DTYPE_ACC == dtypes.float:
+    if GEMM_VARIATION == "max" and (M%64)==0 and (N%128)==0 and (K%64)==0 and DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.float and DTYPE_ACC == dtypes.float:
       print("Using CUDA and triton-generated kernel")
-      # See nv_triton_gemm.annotated.ptx for PTX code which was generated from
-      # `PYTHONPATH=. DEBUG=6 CUDA=1 CUDA_PTX=1 python3 extra/gemm/triton_nv_matmul.py`
+      # See nv_triton_gemm.annotated.ptx for PTX code which was generated from `PYTHONPATH=. DEBUG=6 CUDA=1 CUDA_PTX=1 python3 extra/gemm/triton_nv_matmul.py`
       # this kernel with M=N=K=4096 does 162TFLOPS, vs torch at 144TFLOPS and BEAM=8 tinygrad at 138TFLOPS.  theo max is 165TFLOPS.
 
       # WMMA element size is (M, N, K) = (16, 8, 16)
@@ -70,8 +70,7 @@ if __name__ == "__main__":
       # double-buffer smem = (8192 + 16384) * 2 = 49152 bytes
       # reduce for_loop size = [1, 1, (4096 // 16 // 4)==64]
        # NOTE: T_K > 0 would be group_for_reduce
-      prog = CUDAProgram(device, "wmma_example", compiler.compile(
-        open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp32_fp32.max.cu')).read()))
+      prog = CUDAProgram(device, "wmma_example", compiler.compile(open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp32_fp32.max.cu')).read()))
       args = (c, a, b)
       kwargs = {
         'global_size': [M//64, N//128, 1],
@@ -79,11 +78,9 @@ if __name__ == "__main__":
         'wait': True,
         'vals': (N, K),
       }
-    elif GEMM_VARIATION == "2_stage_swizzled_smem_input" and (M%64)==0 and (N%128)==0 and (K%64)==0 and \
-         DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.float and DTYPE_ACC == dtypes.float:
+    elif GEMM_VARIATION == "2_stage_swizzled_smem_input" and (M%64)==0 and (N%128)==0 and (K%64)==0 and DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.float and DTYPE_ACC == dtypes.float:
       print("Using CUDA, 2-stage reduce pipeline, swizzled SMEM inputs")
-      prog = CUDAProgram(device, "wmma_example", compiler.compile(
-        open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp32_fp32.2_stage_swizzled_smem_input.cu')).read()))
+      prog = CUDAProgram(device, "wmma_example", compiler.compile(open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp32_fp32.2_stage_swizzled_smem_input.cu')).read()))
       args = (c, a, b)
       kwargs = {
         'global_size': [M//64, N//128, 1],
@@ -91,11 +88,9 @@ if __name__ == "__main__":
         'wait': True,
         'vals': (N, K),
       }
-    elif GEMM_VARIATION == "swizzled_smem_input" and (M%64)==0 and (N%128)==0 and (K%64)==0 and \
-         DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.float and DTYPE_ACC == dtypes.float:
+    elif GEMM_VARIATION == "swizzled_smem_input" and (M%64)==0 and (N%128)==0 and (K%64)==0 and DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.float and DTYPE_ACC == dtypes.float:
       print("Using CUDA, swizzled SMEM inputs")
-      prog = CUDAProgram(device, "wmma_example", compiler.compile(
-        open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp32_fp32.swizzled_smem_input.cu')).read()))
+      prog = CUDAProgram(device, "wmma_example", compiler.compile(open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp32_fp32.swizzled_smem_input.cu')).read()))
       args = (c, a, b)
       kwargs = {
         'global_size': [M//64, N//128, 1],
@@ -103,11 +98,9 @@ if __name__ == "__main__":
         'wait': True,
         'vals': (N, K),
       }
-    elif GEMM_VARIATION == "flat_smem_input" and (M%64)==0 and (N%128)==0 and (K%64)==0 and \
-         DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.float and DTYPE_ACC == dtypes.float:
+    elif GEMM_VARIATION == "flat_smem_input" and (M%64)==0 and (N%128)==0 and (K%64)==0 and DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.float and DTYPE_ACC == dtypes.float:
       print("Using CUDA, flat SMEM inputs")
-      prog = CUDAProgram(device, "wmma_example", compiler.compile(
-        open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp32_fp32.flat_smem_input.cu')).read()))
+      prog = CUDAProgram(device, "wmma_example", compiler.compile(open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp32_fp32.flat_smem_input.cu')).read()))
       args = (c, a, b)
       kwargs = {
         'global_size': [M//64, N//128, 1],
@@ -115,24 +108,19 @@ if __name__ == "__main__":
         'wait': True,
         'vals': (N, K),
       }
-    elif GEMM_VARIATION == "hcopt" and M == N == K == 4096 and \
-         DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.float:
+    elif GEMM_VARIATION == "hcopt" and M == N == K == 4096 and DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.float:
       print("Using CUDA and generated hcopt")
-      # [Opt(op=OptOps.TC, axis=0, amt=0), Opt(op=OptOps.UPCAST, axis=0, amt=4),
-      #  Opt(op=OptOps.UPCAST, axis=1, amt=4), Opt(op=OptOps.LOCAL, axis=1, amt=4)]
-      prog = CUDAProgram(device, "wmma_example", compiler.compile(
-        open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp32_fp16.hcopt.cu')).read()))
+      # [Opt(op=OptOps.TC, axis=0, amt=0), Opt(op=OptOps.UPCAST, axis=0, amt=4), Opt(op=OptOps.UPCAST, axis=1, amt=4), Opt(op=OptOps.LOCAL, axis=1, amt=4)]
+      prog = CUDAProgram(device, "wmma_example", compiler.compile(open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp32_fp16.hcopt.cu')).read()))
       args = (c, a, b)
       kwargs = {
         'global_size': [32, 64, 1],
         'local_size': [16, 2, 4], # 16,2 are warp, 4 workgroups upcasted to axis=1
         'wait': True,
       }
-    elif GEMM_VARIATION == "2_stage" and (M%64)== 0 and (N%128)==0 and (K%64)==0 and \
-         DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.half:
+    elif GEMM_VARIATION == "2_stage" and (M%64)== 0 and (N%128)==0 and (K%64)==0 and DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.half:
       print("Using CUDA and un-optimized 2-stage, swizzled SMEM inputs and direct acc to output kernel")
-      prog = CUDAProgram(device, "wmma_example", compiler.compile(
-        open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp16_fp16.2_stage.cu')).read()))
+      prog = CUDAProgram(device, "wmma_example", compiler.compile(open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp16_fp16.2_stage.cu')).read()))
       args = (c, a, b)
       kwargs = {
         'global_size': [M//64, N//128, 1],
@@ -140,11 +128,9 @@ if __name__ == "__main__":
         'wait': True,
         'vals': (N, K),
       }
-    elif GEMM_VARIATION == "3_stage" and (M%256)== 0 and (N%128)==0 and (K%32)==0 and \
-         DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.half:
+    elif GEMM_VARIATION == "3_stage" and (M%256)== 0 and (N%128)==0 and (K%32)==0 and DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.half:
       print("Using CUDA and 3-stage (interleave global copies and ldmatrix)")
-      prog = CUDAProgram(device, "wmma_example", compiler.compile(
-        open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp16_fp16.3_stage.cu')).read()), 73728)
+      prog = CUDAProgram(device, "wmma_example", compiler.compile(open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp16_fp16.3_stage.cu')).read()), 73728)
       args = (c, a, b)
       kwargs = {
         'global_size': [M//256, N//128, 1],
@@ -152,11 +138,9 @@ if __name__ == "__main__":
         'wait': True,
         'vals': (N, K),
       }
-    elif GEMM_VARIATION == "3_stage_swizzled" and (M%256)== 0 and (N%128)==0 and (K%32)==0 and \
-         DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.half:
+    elif GEMM_VARIATION == "3_stage_swizzled" and (M%256)== 0 and (N%128)==0 and (K%32)==0 and DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.half:
       print("Using CUDA and 3-stage (interleave global copies and ldmatrix) and swizzled SMEM inputs")
-      prog = CUDAProgram(device, "wmma_example", compiler.compile(
-        open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp16_fp16.3_stage_swizzled.cu')).read()), 73728)
+      prog = CUDAProgram(device, "wmma_example", compiler.compile(open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp16_fp16.3_stage_swizzled.cu')).read()), 73728)
       args = (c, a, b)
       kwargs = {
         'global_size': [M//256, N//128, 1],
@@ -164,11 +148,9 @@ if __name__ == "__main__":
         'wait': True,
         'vals': (N, K),
       }
-    elif GEMM_VARIATION == "max" and (M%256)== 0 and (N%128)==0 and (K%32)==0 and \
-         DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.half:
+    elif GEMM_VARIATION == "max" and (M%256)== 0 and (N%128)==0 and (K%32)==0 and DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.half:
       print("Using CUDA and 3-stage (interleave global copies and ldmatrix), swizzled SMEM inputs and epilogue")
-      prog = CUDAProgram(device, "wmma_example", compiler.compile(
-        open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp16_fp16.max.cu')).read()), 73728)
+      prog = CUDAProgram(device, "wmma_example", compiler.compile(open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp16_fp16.max.cu')).read()), 73728)
       args = (c, a, b)
       kwargs = {
         'global_size': [M//256, N//128, 1],
@@ -176,11 +158,9 @@ if __name__ == "__main__":
         'wait': True,
         'vals': (N, K),
       }
-    elif GEMM_VARIATION == "no_xor" and (M%256)== 0 and (N%128)==0 and (K%32)==0 and \
-         DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.half:
+    elif GEMM_VARIATION == "no_xor" and (M%256)== 0 and (N%128)==0 and (K%32)==0 and DTYPE_IN == dtypes.half and DTYPE_OUT == dtypes.half and DTYPE_ACC == dtypes.half:
       print("Using CUDA and 3-stage (interleave global copies and ldmatrix), swizzled SMEM inputs and epilogue")
-      prog = CUDAProgram(device, "wmma_example", compiler.compile(
-        open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp16_fp16.no_xor.cu')).read()), 73728)
+      prog = CUDAProgram(device, "wmma_example", compiler.compile(open(os.path.join(script_dir, 'max_kernels/nv.fp16_fp16_fp16.no_xor.cu')).read()), 73728)
       args = (c, a, b)
       kwargs = {
         'global_size': [M//256, N//128, 1],
