@@ -840,7 +840,6 @@ class TestTK(unittest.TestCase):
     np.testing.assert_allclose(v.grad.numpy(), v_ref.grad.numpy(), atol=2e-2, rtol=2e-2)
     np.testing.assert_allclose(k.grad.numpy(), k_ref.grad.numpy(), atol=5e-2, rtol=2e-2)
 
-  @unittest.expectedFailure
   def test_fast_fa_bwd_causal_jitted(self):
     from extra.thunder.tiny.fa import flash_attention
 
@@ -862,19 +861,21 @@ class TestTK(unittest.TestCase):
       out = flash_attention(q_, k_, v_, is_causal=True)
       out = out.float().transpose(1, 2)
       out.backward(do)
-      Tensor.realize(out, q.grad, k.grad, v.grad)
-      return q.grad, k.grad, v.grad
+      # Tensor.realize(out, q.grad, k.grad, v.grad) # this realize breaks it
+      return out, q.grad, k.grad, v.grad
 
     fn_jitted = TinyJit(fn)
 
-    for _ in range(10):
+    for i in range(5):
+      print(f"run {i}")
       q = Tensor.randn(B, N, H, D, dtype=dtypes.bfloat16, requires_grad=True).contiguous()
       k = Tensor.randn(B, N, H_KV, D, dtype=dtypes.bfloat16, requires_grad=True).contiguous()
       v = Tensor.randn(B, N, H_KV, D, dtype=dtypes.bfloat16, requires_grad=True).contiguous()
-      Tensor.realize(q, k, v)
       do = Tensor.ones(B, N, H, D, dtype=dtypes.float32).contiguous()
-      Tensor.realize(do)
-      q.grad, k.grad, v.grad = fn_jitted(q, k, v, do)
+      Tensor.realize(q, k, v, do)
+      print(f"prerealize {i}")
+      out, q.grad, k.grad, v.grad = fn_jitted(q, k, v, do)
+      print(f"done {i}")
 
     with Context(DEBUG=0):
       q_ref = q.detach().clone().requires_grad_(True)
@@ -888,8 +889,8 @@ class TestTK(unittest.TestCase):
     ref.backward(do)
     Tensor.realize(q_ref.grad, k_ref.grad, v_ref.grad)
 
-    np.testing.assert_allclose(q.grad.numpy(), q_ref.grad.numpy(), atol=5e-2, rtol=2e-2)
     np.testing.assert_allclose(v.grad.numpy(), v_ref.grad.numpy(), atol=2e-2, rtol=2e-2)
+    np.testing.assert_allclose(q.grad.numpy(), q_ref.grad.numpy(), atol=5e-2, rtol=2e-2)
     np.testing.assert_allclose(k.grad.numpy(), k_ref.grad.numpy(), atol=5e-2, rtol=2e-2)
 
 if __name__ == "__main__":
