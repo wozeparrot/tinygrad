@@ -109,7 +109,7 @@ _tensor_spec = PatternMatcher([
 
   # device or unique
   (UPat(Ops.CONST, src=(UPat(Ops.DEVICE),)), lambda: True),
-  (UPat(Ops.CONST, src=(UPat(Ops.DEVICE), UPat((Ops.LUNIQUE, Ops.UNIQUE)))), lambda: True),
+  (UPat(Ops.CONST, src=(UPat((Ops.LUNIQUE, Ops.UNIQUE)), UPat(Ops.DEVICE))), lambda: True),
 
   # DETACH and CONTIGUOUS change how we interpret the source UOp
   # CONTIGUOUS ensures the source UOp realizes
@@ -137,7 +137,11 @@ _tensor_spec = PatternMatcher([
 
   # Tensor range bind / store
   (UPat(Ops.BIND, (dtypes.int,dtypes.index,), (UPat(Ops.DEFINE_VAR), UPat(Ops.RANGE)), arg=None), lambda: True),
-  (UPat(Ops.STORE, src=(UPat(), UPat())), lambda: True)
+  (UPat(Ops.STORE, src=(UPat(), UPat())), lambda: True),
+
+  # allow CALL/PARAM
+  (UPat(Ops.CALL, src=(UPat(name="f"),), name="c", allow_any_len=True), lambda c,f: c.dtype == f.dtype),
+  (UPat(Ops.PARAM), lambda: True),
 ])+movement_ops+shared_spec
 
 tensor_spec = PatternMatcher([

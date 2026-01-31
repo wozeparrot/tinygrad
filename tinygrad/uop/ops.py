@@ -58,6 +58,11 @@ def multirange_str(rngs:Iterable[UOp], color=False, pad=None) -> str:
   if pad is not None: ret += " " * (pad-ansilen(ret))
   return ret
 
+def shape_to_shape_arg(arg:tuple[sint, ...]) -> UOp:
+  if len(arg) == 0: return UOp(Ops.VECTORIZE, dtypes.index.vec(0))
+  elif all(isinstance(x, int) for x in arg): return UOp.const(dtypes.index.vec(len(arg)), cast(tuple[int, ...], arg))
+  else: return UOp(Ops.VECTORIZE, dtypes.index.vec(len(arg)), tuple(UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in arg))
+
 def consumer_map_from_toposort(lst:Iterable[UOp]):
   ret: dict[UOp, dict[UOp, None]] = {}
   for u in lst:
@@ -220,9 +225,13 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       case Ops.ENCDEC: return self.arg[0]
       case Ops.BUFFERIZE: return tuple([int(r.vmax+1) for r in self.src[1:]])
       case Ops.DEFINE_GLOBAL | Ops.DEFINE_LOCAL | Ops.DEFINE_REG: return (self.ptrdtype.size,)
+      case Ops.PARAM:
+        # NOTE: copied from marg
+        if len(self.src) >= 1: return tuple(self.src[0].sgep(i) for i in range(self.src[0].dtype.count))
+        return None
 
       # passthrough ops
-      case Ops.REDUCE | Ops.MSTACK | Ops.MSELECT | Ops.DETACH | Ops.CONTIGUOUS | Ops.CONTIGUOUS_BACKWARD | Ops.AFTER | Ops.END:
+      case Ops.REDUCE | Ops.MSTACK | Ops.MSELECT | Ops.DETACH | Ops.CONTIGUOUS | Ops.CONTIGUOUS_BACKWARD | Ops.AFTER | Ops.END | Ops.CALL:
         return self.src[0]._shape
 
       # ops with custom handling
@@ -432,7 +441,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     # NOTE: b is ConstType, not ConstLike, so UOps and tuples aren't allowed
     assert not isinstance(b, (UOp, tuple)), "unique const only works on numbers"
     ret = UOp.const(dtype, b, device)
-    return ret.replace(src=ret.src + (UOp.unique(None if unique is True else unique),))
+    return ret.replace(src=(UOp.unique(None if unique is True else unique),) + ret.src)
   @staticmethod
   def range(end:sint, axis_id, axis_type=AxisType.LOOP, *arg, dtype=dtypes.index, src=(), **kwargs):
     return UOp(Ops.RANGE, dtype=dtype, src=(sint_to_uop(end, dtype),)+src, arg=(axis_id, axis_type)+arg, **kwargs)
@@ -554,11 +563,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       case Ops.PAD | Ops.SHRINK: src_args = list(zip(*arg))
       case Ops.PERMUTE | Ops.FLIP: src_args = []
       case _: raise RuntimeError(f"{op} is not a MovementOp")
-    usrcs = []
-    for arg in src_args:
-      if len(arg) == 0: usrcs.append(UOp(Ops.VECTORIZE, dtypes.index.vec(0)))
-      elif all(isinstance(x, int) for x in arg): usrcs.append(UOp.const(dtypes.index.vec(len(arg)), arg))
-      else: usrcs.append(UOp(Ops.VECTORIZE, dtypes.index.vec(len(arg)), tuple(UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in arg)))
+    usrcs = [shape_to_shape_arg(arg) for arg in src_args]
     if len(usrcs) == 0: ret = UOp(op, self.dtype, (self,), arg)
     else: ret = UOp(op, self.dtype, (self,)+UOp.sink(*usrcs).simplify().src)
     # for all movement ops, we check shape property to validity check the movement op
@@ -820,6 +825,13 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def set(self:UOp, val:UOp|ConstType, end:UOp|tuple[UOp, ...]|list[UOp]=()) -> UOp:
     return self.src[0].after(self.store(val).end(*argfix(end)))
 
+  # TODO: this should replace placeholder
+  @staticmethod
+  def param(slot:int, dtype:DType, shape:tuple[sint, ...]|None=None, device=None):
+    src = (UOp(Ops.NOOP) if shape is None else shape_to_shape_arg(shape),) + (() if device is None else (UOp(Ops.DEVICE, arg=device),))
+    return UOp(Ops.PARAM, dtype, src, arg=slot)
+
+  def call(*srcs:UOp, fxn:UOp, arg:Any|None) -> UOp: return UOp(Ops.CALL, fxn.dtype, (fxn,)+srcs, arg)
   def custom_kernel(*srcs:UOp, fxn:Callable, grad_fxn:Callable|None=None) -> list[UOp]:
     contig_srcs = tuple(x.contiguous() if x.op is not Ops.AFTER else x for x in srcs)
     kernel = UOp(Ops.CUSTOM_KERNEL, src=contig_srcs, arg=CustomKernel(fxn=fxn, grad_fxn=grad_fxn))
@@ -1366,8 +1378,8 @@ def render_marg(ctx,x:UOp):
 sugar = {Ops.SINK, Ops.END, Ops.STORE, Ops.LOAD, Ops.UNIQUE, Ops.SQRT, Ops.INDEX, Ops.REDUCE, Ops.AFTER, Ops.THREEFRY,
          Ops.WHERE, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.CONTIGUOUS, Ops.BARRIER, Ops.ASSIGN, Ops.DETACH}
 pm_pyrender_extra = PatternMatcher([
-  (UPat(Ops.CONST, src=(UPat(Ops.DEVICE, name="d"), UPat(Ops.UNIQUE, name="u")), name="x"),
-   lambda x,d,u: f"UOp.unique_const({x.dtype}, {x.arg}, device={repr(d.arg)}, unique={u.arg})"),
+  (UPat(Ops.CONST, src=(UPat(Ops.UNIQUE, name="u"), UPat(Ops.DEVICE, name="d")), name="x"),
+   lambda x,u,d: f"UOp.unique_const({x.dtype}, {x.arg}, device={repr(d.arg)}, unique={u.arg})"),
   (UPat(Ops.CONST, src=(UPat(Ops.DEVICE, name="d"),), name="x"), lambda x,d: f"UOp.const({x.dtype}, {x.arg}, device={repr(d.arg)})"),
   (UPat(Ops.CONST, name="x"), lambda x: f"UOp.const({x.dtype}, {x.arg})"),
   (UPat(Ops.DEFINE_VAR, src=(), name="x"), lambda x:
