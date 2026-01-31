@@ -4,7 +4,7 @@ from tinygrad.helpers import GlobalCounters, getenv
 
 GPUS = getenv("GPUS", 4) # TODO: expose a way in tinygrad to access this
 N = getenv("N", 6144)
-ROUNDS = getenv("ROUND", 8)
+ROUNDS = getenv("ROUNDS", 8)
 
 @TinyJit
 def many_matmul(A, B):
