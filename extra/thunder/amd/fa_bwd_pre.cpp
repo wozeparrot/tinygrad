@@ -8,40 +8,19 @@ constexpr int ATTN_B = 16; // batch size
 constexpr int ATTN_H = 64; // number of query heads
 #endif
 
-#ifndef ATTN_H_KV
-constexpr int ATTN_H_KV = 8; // number of key/value heads (for GQA)
-#endif
-
-constexpr int GROUP_SIZE = ATTN_H / ATTN_H_KV; // queries per KV head group
-
 #ifndef ATTN_N
 constexpr int ATTN_N = 1024; // sequence length
 #endif
 
 constexpr int ATTN_D = 128; // dimension
-constexpr int STEP_QO = 64; // block size for QO
-constexpr int BLOCK_SIZE_KV = 256; // block size for KV
-constexpr int SLICE_QO = 32;
 constexpr int DOT_SLICE_QO = 16;
-constexpr int WARP_SIZE_KV = 64; // warp size for KV
 
 #define NUM_WARPS 4
 #define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
 
-using G = kittens::group<NUM_WARPS>;
-
 using namespace kittens;
 
 template<int D, typename T=bf16, typename L=row_l, typename S=rt_16x32_s> using qo_tile = rt<T, DOT_SLICE_QO, D, L, S>;
-template<int D, typename T=bf16, typename L=row_l, typename S=rt_16x32_s> using kv_tile = rt<T, WARP_SIZE_KV, D, L, S>;
-template<int D, typename T=bf16, typename L=row_l, typename S=rt_16x32_s> using qo_tile_T_dq = rt<T, 32, 16, L, S>;
-template<int D, typename T=bf16, typename L=row_l, typename S=rt_16x32_s> using qo_tile_dq = rt<T, 16, 32, L, S>;
-template<int D, typename T=bf16, typename L=row_l, typename S=rt_16x32_s> using kv_tile_T = rt<T, D, WARP_SIZE_KV, L, S>;
-template<int D, typename T=float, typename L=col_l, typename S=rt_16x16_s> using attn_tile = rt<T, DOT_SLICE_QO, WARP_SIZE_KV, L, S>;
-template<int D, typename T=bf16, typename L=col_l, typename S=rt_32x16_s> using attn_tile_T = rt<T, WARP_SIZE_KV, DOT_SLICE_QO, L, S>;
-
-template<int D, typename T=bf16, typename L=col_l, typename S=rt_32x16_s> using attn_tile_T_dq = rt<T, 256, 16, L, S>;
-template<int D, typename T=bf16, typename L=row_l, typename S=rt_16x32_s> using kv_tile_dq = rt<T, 256, 32, L, S>;
 
 template<int D> struct attn_prep_globals { 
     gl<bf16, -1, -1, -1, -1> Og;

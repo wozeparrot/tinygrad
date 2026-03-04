@@ -1,5 +1,5 @@
 #include "kittens.cuh"
-#include "utils.cpp"
+#include "utils.cpp" // atomic_pk_add_bf16_row fix: 2 atomics per dwordx2 store
 
 #ifndef ATTN_B
 constexpr int ATTN_B = 16; // batch size
@@ -37,7 +37,7 @@ using namespace kittens;
 using _gl_QdO  = gl<bf16, ATTN_B, ATTN_N, ATTN_H, ATTN_D>;
 using _gl_KV   = gl<bf16, ATTN_B, ATTN_N, ATTN_H_KV, ATTN_D>;
 using _gl_dQ   = gl<bf16, ATTN_B, ATTN_H, ATTN_N, ATTN_D>;
-using _gl_dKV  = gl<bf16, ATTN_B * GROUP_SIZE, ATTN_N, ATTN_H_KV, ATTN_D>;
+using _gl_dKV  = gl<bf16, ATTN_B, ATTN_N, ATTN_H_KV, ATTN_D>;
 using _gl_Lvec = gl<float, ATTN_B, ATTN_H, 1, ATTN_N>;
 
 template<int D> struct attn_bwd_combined_globals {
@@ -57,7 +57,6 @@ __global__ void attend_bwd_combined_ker(bf16 *dQ_ptr, bf16 *dK_ptr, bf16 *dV_ptr
 
   const int q_head_idx_fixed = blockIdx.x;  // This is the query head index [0, ATTN_H)
   const int kv_head_idx = q_head_idx_fixed / GROUP_SIZE;
-  const int q_head_in_group = q_head_idx_fixed % GROUP_SIZE;
   const int seq_idx = blockIdx.y;
   const int batch_idx = blockIdx.z;
   const int first_q_head = q_head_idx_fixed;
@@ -3357,18 +3356,30 @@ __global__ void attend_bwd_combined_ker(bf16 *dQ_ptr, bf16 *dK_ptr, bf16 *dV_ptr
     }
   }
 
-  store<1>(g.dVg, dV_j, {batch_idx * GROUP_SIZE + q_head_in_group, 0, kv_head_idx, 0}, {0, j, 0, 0});
+  // dQ epilogue: use explicit per-register mul calls (not full-tile mul) to prevent the compiler
+  // from using art VGPR registers as scratch between separate asm volatile blocks.
+  mul<0, 0, 0>(dQ_i_T, dQ_i_T, dP_SCALE_FACTOR);
+  mul<0, 0, 1>(dQ_i_T, dQ_i_T, dP_SCALE_FACTOR);
+  mul<0, 0, 2>(dQ_i_T, dQ_i_T, dP_SCALE_FACTOR);
+  mul<0, 0, 3>(dQ_i_T, dQ_i_T, dP_SCALE_FACTOR);
+  atomic_pk_add_bf16_with_warpid<2, 0, 0>(g.dQg, dQ_i, {batch_idx, q_head_idx, q_seq_idx * 4 + 3, 0}, warpid);
+  mul<1, 0, 0>(dQ_i_T, dQ_i_T, dP_SCALE_FACTOR);
+  mul<1, 0, 1>(dQ_i_T, dQ_i_T, dP_SCALE_FACTOR);
+  mul<1, 0, 2>(dQ_i_T, dQ_i_T, dP_SCALE_FACTOR);
+  mul<1, 0, 3>(dQ_i_T, dQ_i_T, dP_SCALE_FACTOR);
+  atomic_pk_add_bf16_with_warpid<2, 0, 1>(g.dQg, dQ_i, {batch_idx, q_head_idx, q_seq_idx * 4 + 3, 0}, warpid);
+  __builtin_amdgcn_s_waitcnt(0);
+
+  // dV store via atomic accumulation (multiple Q heads contribute to the same KV head)
+  atomic_pk_add_bf16_row<1>(g.dVg, dV_j, {batch_idx, 0, kv_head_idx, 0}, {0, j, 0, 0});
   __builtin_amdgcn_s_waitcnt(0);
   __builtin_amdgcn_s_barrier();
 
-  // We first copy dV_j_T from accumulator GPRs to vector GPRs and then perform the store
+  // Copy dK_j_T from accumulator GPRs to vector GPRs, scale, and store via atomic accumulation
   accvgpr_read(dV_j_T, dK_j_T);
   mul(dV_j_T, dV_j_T, dP_SCALE_FACTOR);
-  store<1>(g.dKg, dV_j, {batch_idx * GROUP_SIZE + q_head_in_group, 0, kv_head_idx, 0}, {0, j, 0, 0});
-
-  // Write out final dQ_i slice
-  mul(dQ_i_T, dQ_i_T, dP_SCALE_FACTOR);
-  atomic_pk_add_bf16_with_warpid<2>(g.dQg, dQ_i, {batch_idx, q_head_idx, q_seq_idx * 4 + 3, 0}, warpid);
+  atomic_pk_add_bf16_row<1>(g.dKg, dV_j, {batch_idx, 0, kv_head_idx, 0}, {0, j, 0, 0});
+  __builtin_amdgcn_s_waitcnt(0);
 }
 
 template __global__ void attend_bwd_combined_ker<ATTN_D>(bf16*, bf16*, bf16*, bf16*, bf16*, bf16*, bf16*, float*, float*);
