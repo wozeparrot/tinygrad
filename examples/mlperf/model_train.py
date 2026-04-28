@@ -1282,7 +1282,7 @@ def train_bert():
         previous_step = i
 
 def train_llama3():
-  from examples.mlperf.models.flat_llama import FlatTransformer, apply_grad, FP8, FP8_DTYPE
+  from examples.mlperf.models.flat_llama import FlatTransformer, apply_grad, FP8_DTYPE
   from examples.llama3 import MODEL_PARAMS
   from examples.mlperf.lr_schedulers import CosineAnnealingLRWithWarmup
   from examples.mlperf.optim import GradAccClipAdamW
@@ -1432,18 +1432,17 @@ def train_llama3():
     print(f"loading optim checkpoint from {fn}")
     load_state_dict(scheduler, safe_load(fn), realize=False)
 
-  fp8_amax = [t for ts in model._fp8_amax.values() for t in ts] if FP8 else []
-  fp8_inv_scales = list(model._fp8_inv_scale.values()) if FP8 else []
+  fp8_amax = [t for ts in model._fp8_amax.values() for t in ts]
+  fp8_inv_scales = list(model._fp8_inv_scale.values())
 
-  if FP8:
-    from tinygrad.nn.state import get_state_dict
-    model_state = get_state_dict(model)
-    for wname in ["wqkv", "wo", "w13", "w2"]:
-      w = model_state[wname]
-      w._inv_scale = model._fp8_inv_scale[wname]
-      if optim.master_params:
-        idx = next(j for j, p in enumerate(optim.params) if p is w)
-        optim.master_params[idx].assign((optim.master_params[idx] * w._inv_scale.reshape(-1, *([1]*(w.ndim-1)))).contiguous())
+  from tinygrad.nn.state import get_state_dict
+  model_state = get_state_dict(model)
+  for wname in ["wqkv", "wo", "w13", "w2"]:
+    w = model_state[wname]
+    w._inv_scale = model._fp8_inv_scale[wname]
+    if optim.master_params:
+      idx = next(j for j, p in enumerate(optim.params) if p is w)
+      optim.master_params[idx].assign((optim.master_params[idx] * w._inv_scale.reshape(-1, *([1]*(w.ndim-1)))).contiguous())
 
   @TinyJit
   def minibatch(tokens:Tensor):
@@ -1559,7 +1558,7 @@ def train_llama3():
 
       mem_gb = GlobalCounters.mem_used / 1e9
       gflops = GlobalCounters.global_ops / 1e9 / dev_time
-      mfu = ((6 * num_params * SEQLEN * GBS) / (dev_time * device_count * (4.6e15 if FP8 else 2.3e15))) * 100
+      mfu = ((6 * num_params * SEQLEN * GBS) / (dev_time * device_count * 4.6e15)) * 100
       tqdm.write(
           f"{i:5} {step_time:.3f} s step, {gbs_time:.3f} s gbs, {optim_time:.3f} s optim, {data_time:.3f} s data, {loss:.4f} loss, " \
           f"{lr:.12f} LR, {grad_norm:.6f} grad_norm, {mem_gb:.2f} GB used, {gflops:9.2f} GFLOPS, {mfu:5.2f}% MFU")
