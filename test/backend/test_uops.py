@@ -13,11 +13,10 @@ from tinygrad.device import is_dtype_supported
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.renderer.ptx import PTXRenderer
 from test.helpers import to_uops_list
-from dataclasses import replace
 
 def _uops_to_prg(uops_list):
   prg = to_program(UOp.sink(*uops_list, arg=KernelInfo()), Device[Device.DEFAULT].renderer)
-  return CompiledRunner(prg.replace(arg=replace(prg.arg, device=Device.DEFAULT)))
+  return CompiledRunner(prg, Device.DEFAULT)
 
 def uop(uops:list[UOp], op:Ops, dtype:Optional[DType], src:tuple[UOp, ...], arg:Any=None) -> UOp:
   if op is Ops.CONST: uops.append(UOp.const(dtype, arg))
