@@ -43,7 +43,7 @@ def matmul(x:Tensor, w:Tensor, fp8:bool=True, amax_x:Tensor|None=None, w_inv_sca
   if ASM_GEMM:
     from extra.gemm.cdna_asm_gemm import can_use_asm_gemm, asm_gemm
     if can_use_asm_gemm(x_fp8, w.T): return asm_gemm(x_fp8, w.T, x_scale=x_scale, w_scale=w_inv_scale), x_new_amax, x_fp8, w
-  return x_fp8.dot(w.T, dtype=dtypes.float) * x_scale * w_inv_scale, x_new_amax, x_fp8, w
+  return (x_fp8.dot(w.T, dtype=dtypes.float) * x_scale * w_inv_scale).cast(dtypes.bfloat16), x_new_amax, x_fp8, w
 
 def norm_mul_quantize_matmul(x:Tensor, norm:Tensor, amax_x, w_inv_scale, w:Tensor, eps:float):
   FUSED_NORM_MUL_QUANTIZE = getenv("FUSED_NORM_MUL_QUANTIZE", 0)
