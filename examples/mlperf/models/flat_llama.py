@@ -46,7 +46,7 @@ def matmul(x:Tensor, w:Tensor, fp8:bool=True, amax_x:Tensor|None=None, w_inv_sca
   return x_fp8.dot(w.T, dtype=dtypes.float) * x_scale * w_inv_scale, x_new_amax, x_fp8, w
 
 def norm_mul_quantize_matmul(x:Tensor, norm:Tensor, amax_x, w_inv_scale, w:Tensor, eps:float):
-  FUSED_NORM_MUL_QUANTIZE = getenv("FUSED_NORM_MUL_QUANTIZE", 1)
+  FUSED_NORM_MUL_QUANTIZE = getenv("FUSED_NORM_MUL_QUANTIZE", 0)
   normed, rrms = rmsnorm(x, eps)
   if FUSED_NORM_MUL_QUANTIZE:
     from extra.llama_kernels.fused_mul_quantize_fp8 import fused_mul_quantize_fp8
@@ -59,7 +59,7 @@ def norm_mul_quantize_matmul(x:Tensor, norm:Tensor, amax_x, w_inv_scale, w:Tenso
   return out, normed, rrms, ret
 
 def silu_w13_matmul(x_w13:Tensor, w2:Tensor, amax_x2, s_2):
-  FUSED_SILU_W13 = getenv("FUSED_SILU_W13", 1)
+  FUSED_SILU_W13 = getenv("FUSED_SILU_W13", 0)
   if FUSED_SILU_W13:
     from extra.llama_kernels.cast_amax import fused_quantize_fp8_w13
     amax_s = amax_x2 if amax_x2 is not None else Tensor.full((), 1.0, dtype=dtypes.bfloat16, device=x_w13.device)
