@@ -1,4 +1,4 @@
-import math, os, functools
+import math, os
 if __name__ == "__main__":
   os.environ["DEFAULT_FLOAT"] = "bfloat16"
   os.environ["OPTIM_DTYPE"] = "bfloat16"
@@ -19,7 +19,6 @@ from extra.models.llama import apply_rotary_emb, precompute_freqs_cis
 from extra.llama_kernels.rmsnorm import rmsnorm
 from extra.llama_kernels import FP8_MAX, local_abs_max
 
-FP8 = getenv("FP8", 0)
 ASM_GEMM = getenv("ASM_GEMM", 0)
 
 FP8_DTYPE = dtypes.fp8e4m3
@@ -32,7 +31,7 @@ def quantize_fp8(x:Tensor, amax_state:Tensor|None=None):
   x_clamped = x_scaled + (x_scaled.detach().clamp(-FP8_MAX, FP8_MAX) - x_scaled.detach())  # STE
   return x_clamped.cast(FP8_DTYPE), scale.float().reciprocal(), new_amax
 
-def matmul(x:Tensor, w:Tensor, fp8=FP8, amax_x:Tensor|None=None, w_inv_scale:Tensor|None=None,
+def matmul(x:Tensor, w:Tensor, fp8:bool=True, amax_x:Tensor|None=None, w_inv_scale:Tensor|None=None,
            x_fp8:Tensor|None=None, x_scale:Tensor|None=None, x_new_amax:Tensor|None=None) -> tuple[Tensor,...]:
   if not fp8:
     if ASM_GEMM:
@@ -49,7 +48,7 @@ def matmul(x:Tensor, w:Tensor, fp8=FP8, amax_x:Tensor|None=None, w_inv_scale:Ten
 def norm_mul_quantize_matmul(x:Tensor, norm:Tensor, amax_x, w_inv_scale, w:Tensor, eps:float):
   FUSED_NORM_MUL_QUANTIZE = getenv("FUSED_NORM_MUL_QUANTIZE", 1)
   normed, rrms = rmsnorm(x, eps)
-  if FP8 and FUSED_NORM_MUL_QUANTIZE:
+  if FUSED_NORM_MUL_QUANTIZE:
     from extra.llama_kernels.fused_mul_quantize_fp8 import fused_mul_quantize_fp8
     amax_s = amax_x if amax_x is not None else Tensor.full((), 1.0, dtype=dtypes.bfloat16, device=normed.device)
     x_fp8, x_inv_scale, new_amax = fused_mul_quantize_fp8(normed, norm, amax_s, FP8_DTYPE)
@@ -61,7 +60,7 @@ def norm_mul_quantize_matmul(x:Tensor, norm:Tensor, amax_x, w_inv_scale, w:Tenso
 
 def silu_w13_matmul(x_w13:Tensor, w2:Tensor, amax_x2, s_2):
   FUSED_SILU_W13 = getenv("FUSED_SILU_W13", 1)
-  if FP8 and FUSED_SILU_W13:
+  if FUSED_SILU_W13:
     from extra.llama_kernels.cast_amax import fused_quantize_fp8_w13
     amax_s = amax_x2 if amax_x2 is not None else Tensor.full((), 1.0, dtype=dtypes.bfloat16, device=x_w13.device)
     x2_fp8, x2_inv_scale, new_amax_x2 = fused_quantize_fp8_w13(x_w13, amax_s, FP8_DTYPE)
@@ -86,7 +85,7 @@ class FlatTransformer:
     scaled_std = 0.02 / math.sqrt(2 * n_layers)
 
     # Attention
-    self._init_inv_scales = []  # populated by lin_per_layer when FP8
+    self._init_inv_scales = []  # populated by lin_per_layer
     self.wqkv = self.lin_per_layer(dim, self.n_heads * self.head_dim + self.n_kv_heads * self.head_dim * 2)
     self.wo = self.lin_per_layer(self.n_heads * self.head_dim, dim, std=scaled_std)
 
@@ -105,21 +104,19 @@ class FlatTransformer:
     self.output = Tensor.normal(1, vocab_size, dim, mean=0.0, std=0.02, dtype=dtypes.bfloat16)
     self.freqs_cis = precompute_freqs_cis(dim // n_heads, max_context * 2, rope_theta).contiguous().requires_grad_(False)
 
-    if FP8:
-      def _amax(): return Tensor.full((), FP8_MAX).contiguous().requires_grad_(False)
-      names = ["xqkv", "xo", "x13", "x2"]
-      self._fp8_amax = {name: [_amax() for _ in range(n_layers)] for name in names}
-      # per-weight inv_scale: single (n_layers,) float32 tensor per weight (kernel reads float* pointers)
-      w_names = ["wqkv", "wo", "w13", "w2"]
-      self._fp8_inv_scale = {}
-      for wname, inv_scales in zip(w_names, self._init_inv_scales):
-        self._fp8_inv_scale[wname] = inv_scales.float().contiguous().requires_grad_(False)
-      del self._init_inv_scales
+    def _amax(): return Tensor.full((), FP8_MAX).contiguous().requires_grad_(False)
+    names = ["xqkv", "xo", "x13", "x2"]
+    self._fp8_amax = {name: [_amax() for _ in range(n_layers)] for name in names}
+    # per-weight inv_scale: single (n_layers,) float32 tensor per weight (kernel reads float* pointers)
+    w_names = ["wqkv", "wo", "w13", "w2"]
+    self._fp8_inv_scale = {}
+    for wname, inv_scales in zip(w_names, self._init_inv_scales):
+      self._fp8_inv_scale[wname] = inv_scales.float().contiguous().requires_grad_(False)
+    del self._init_inv_scales
 
   def lin_per_layer(self, in_features:int, out_features:int, std:float=0.02):
     if getenv("ZEROS", 0): w = Tensor.zeros(self.n_layers, out_features, in_features)
     else: w = Tensor.normal(self.n_layers, out_features, in_features, mean=0.0, std=std)
-    if not FP8: return w
     # per-layer scaled fp8 cast: fill the fp8 range for best precision
     amax = w.abs().flatten(1).max(1).detach()
     scale = FP8_MAX / (amax + 1e-8)
@@ -141,7 +138,7 @@ class FlatTransformer:
     xv = xqkv[:, :, :, self.n_rep+1].reshape(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
-    if FP8: xq, xk, xv = xq.cast(dtypes.bfloat16), xk.cast(dtypes.bfloat16), xv.cast(dtypes.bfloat16)
+    xq, xk, xv = xq.cast(dtypes.bfloat16), xk.cast(dtypes.bfloat16), xv.cast(dtypes.bfloat16)
     xq, xk, xv = xq.transpose(1, 2), xk.transpose(1, 2), xv.transpose(1, 2)
     if getenv("HK_FLASH_ATTENTION"):
       from extra.thunder.amd.fa import flash_attention
@@ -205,32 +202,26 @@ class FlatTransformer:
       self.tok_embeddings.weight.shard_(device, axis=0).realize()
       self.output.shard_(device, axis=1).realize()
       self.freqs_cis.shard_(device, axis=None).realize()
-      if FP8:
-        for name in self._fp8_amax:
-          for i in range(len(self._fp8_amax[name])):
-            self._fp8_amax[name][i] = self._fp8_amax[name][i].to(device).contiguous().requires_grad_(False)
-        for name in self._fp8_inv_scale:
-          self._fp8_inv_scale[name] = self._fp8_inv_scale[name].to(device).contiguous().requires_grad_(False)
+      for name in self._fp8_amax:
+        for i in range(len(self._fp8_amax[name])):
+          self._fp8_amax[name][i] = self._fp8_amax[name][i].to(device).contiguous().requires_grad_(False)
+      for name in self._fp8_inv_scale:
+        self._fp8_inv_scale[name] = self._fp8_inv_scale[name].to(device).contiguous().requires_grad_(False)
 
   def __call__(self, tokens:Tensor):
     h = self.tok_embeddings(tokens)
     freqs_cis = self.freqs_cis.cast(h.dtype)[:, :tokens.shape[1], :, :, :]
-    a = self._fp8_amax if FP8 else None
-    s = self._fp8_inv_scale if FP8 else None
+    amaxs, inv_scales = self._fp8_amax, self._fp8_inv_scale
     for i in range(self.n_layers):
-      amax_layer = {"amax_xqkv": a["xqkv"][i], "amax_xo": a["xo"][i],
-                    "amax_x13": a["x13"][i], "amax_x2": a["x2"][i]} if a else {}
-      scale_layer = {"s_qkv": s["wqkv"][i], "s_o": s["wo"][i],
-                     "s_13": s["w13"][i], "s_2": s["w2"][i]} if s else {}
       h, *ret = self.run_layer(h, freqs_cis,
                                self.attention_norm[i], self.wqkv[i], self.wo[i],
                                self.ffn_norm[i], self.w13[i], self.w2[i],
-                               **amax_layer, **scale_layer)
-      if a:
-        amaxs = ret[:5]
-        amax_names = ["xqkv", "xo", "x13", "x2"]
-        for name, new_val in zip(amax_names, amaxs):
-          a[name][i].assign(new_val)
+                               amax_xqkv=amaxs["xqkv"][i], amax_xo=amaxs["xo"][i],
+                               amax_x13=amaxs["x13"][i], amax_x2=amaxs["x2"][i],
+                               s_qkv=inv_scales["wqkv"][i], s_o=inv_scales["wo"][i],
+                               s_13=inv_scales["w13"][i], s_2=inv_scales["w2"][i])
+      for name, new_val in zip(["xqkv", "xo", "x13", "x2"], ret[:5]):
+        amaxs[name][i].assign(new_val)
 
     logits = matmul(self.norm(h).contiguous().contiguous_backward(), self.output[0], fp8=False)[0].contiguous_backward()
     return logits
