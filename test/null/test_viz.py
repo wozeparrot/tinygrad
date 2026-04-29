@@ -11,7 +11,7 @@ from tinygrad.helpers import cpu_profile, ProfilePointEvent, unwrap
 from tinygrad.device import Buffer
 
 from tinygrad.uop.ops import tracked_keys, tracked_ctxs, uop_fields, active_rewrites, active_group, _name_cnt, RewriteTrace
-from tinygrad.viz.serve import load_rewrites, get_full_rewrite, uop_to_json, VizData
+from tinygrad.viz.serve import load_rewrites, get_full_rewrite, uop_to_json, VizData, get_render
 from tinygrad.codegen import to_program_cache
 from tinygrad.codegen import to_program
 
@@ -706,7 +706,6 @@ class TestVizMemoryLayout(unittest.TestCase):
     self.assertEqual(len(programs), len(set(users)), n)
 
 from tinygrad.uop.ops import KernelInfo
-from tinygrad.viz.serve import amdgpu_cfg
 from tinygrad.renderer.amd.dsl import s
 from tinygrad.runtime.autogen.amd.rdna3.ins import (s_add_u32, s_branch, s_cbranch_execz, s_cbranch_scc0, s_cbranch_scc1, s_cmp_eq_i32,
                                                     s_cmp_eq_u64, s_code_end, s_endpgm, s_mov_b32, s_nop)
@@ -722,10 +721,13 @@ class TestCfg(unittest.TestCase):
       gidx = UOp.special(1, "gidx0")
       sink = UOp.sink(out.base, lidx, gidx, arg=KernelInfo(name=name))
       return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg="NULL"), UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=x) for x in insts]))))
-    with Context(DEV=f"NULL::{self.arch}"):
-      out = Tensor.custom_kernel(Tensor.empty(1), fxn=fxn)[0]
-      prg = to_program(out.schedule_linear().src[-1].src[0], Device[out.device].renderer)
-      return amdgpu_cfg(prg.src[4].arg, self.arch)
+    with save_viz() as viz:
+      with Context(DEV=f"NULL::{self.arch}"):
+        out = Tensor.custom_kernel(Tensor.empty(1), fxn=fxn)[0]
+        _ = to_program(out.schedule_linear().src[-1].src[0], Device[out.device].renderer)
+    codegen_rewrites = next(s for s in viz.list_items() if s["name"] == name)
+    disasm = next(s for s in codegen_rewrites["steps"] if s["name"] == "View Disassembly")
+    return get_render(viz.data, disasm["query"])
 
   def test_simple(self):
     k = Kernel()
