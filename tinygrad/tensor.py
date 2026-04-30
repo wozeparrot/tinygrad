@@ -552,6 +552,20 @@ class Tensor(OpMixin):
     Tensor._seed, Tensor._device_seeds, Tensor._device_rng_counters = seed, {}, {}
 
   @staticmethod
+  def _next_counter(device:str, num:int) -> tuple[Tensor, Tensor]:
+    if device not in Tensor._device_seeds:
+      seed = [int.from_bytes(hashlib.sha256(len(Tensor._device_seeds).to_bytes(4, "big")).digest(), "big"), Tensor._seed]
+      Tensor._device_seeds[device] = Tensor(seed, device=device, dtype=dtypes.uint32, requires_grad=False)
+      Tensor._device_rng_counters[device] = Tensor([0, 0], device=device, dtype=dtypes.uint32, requires_grad=False)
+    counter = Tensor._device_rng_counters[device]
+    new_low = counter[0:1] + (num & 0xffffffff)
+    new_high = counter[1:2] + (num >> 32) + (new_low < counter[0])
+    counter.assign(new_low.cat(new_high))
+    low = counter[0:1] - (num & 0xffffffff)
+    high = counter[1:2] - (num >> 32) - (counter[0] < (num & 0xffffffff))
+    return Tensor._device_seeds[device], low.cat(high)
+
+  @staticmethod
   def rand(*shape, device:str|None=None, dtype:DTypeLike|None=None, contiguous:bool=True, **kwargs) -> Tensor:
     """
     Creates a tensor with the given shape, filled with random values from a uniform distribution over the interval `[0, 1)`.
@@ -574,22 +588,8 @@ class Tensor(OpMixin):
     # if shape has 0, return zero tensor
     if (numel := prod(shape)) == 0: return Tensor.zeros(shape, device=device, dtype=dt, **kwargs)
     num = ceildiv(numel * dt.itemsize, 4)
-
-    # generate per device seeds and rng counter if we haven't seen this device yet
-    if device not in Tensor._device_seeds:
-      Tensor._device_seeds[device] = Tensor(
-        [int.from_bytes(hashlib.sha256(len(Tensor._device_seeds).to_bytes(4, "big")).digest(), "big"), Tensor._seed],
-        device=device, dtype=dtypes.uint32, requires_grad=False)
-      Tensor._device_rng_counters[device] = Tensor([0, 0], device=device, dtype=dtypes.uint32, requires_grad=False).contiguous()
-
-    # increment rng counter for devices
-    new_low = Tensor._device_rng_counters[device][0:1] + (num & 0xffffffff)
-    new_high = Tensor._device_rng_counters[device][1:2] + (num >> 32) + (new_low < Tensor._device_rng_counters[device][0]).cast(dtypes.uint32)
-    Tensor._device_rng_counters[device].assign(new_low.cat(new_high))
-
-    low = Tensor._device_rng_counters[device][0:1] - (num & 0xffffffff)
-    high = Tensor._device_rng_counters[device][1:2] - (num >> 32) - (Tensor._device_rng_counters[device][0] < (num & 0xffffffff)).cast(dtypes.uint32)
-    bits = Tensor.random_bits(Tensor._device_seeds[device], low.cat(high), num)
+    key, counter = Tensor._next_counter(device, num)
+    bits = Tensor.random_bits(key, counter, num)
     out = Tensor._bits_to_rand(bits, shape, dt).requires_grad_(kwargs.get("requires_grad"))
     return out.contiguous() if contiguous else out
 
@@ -692,7 +692,7 @@ class Tensor(OpMixin):
   def randint(*shape, low=0, high=10, dtype=dtypes.int32, **kwargs) -> Tensor:
     """
     Creates a tensor with the given shape, filled with random integer values generated uniformly from the interval `[low, high)`.
-    If `dtype` is not specified, the default type is used.
+    Requires `low < high`. If `dtype` is not specified, the default type is used.
 
     You can pass in the `device` keyword argument to control device of the tensor.
     Additionally, all other keyword arguments are passed to the constructor of the tensor.
@@ -704,12 +704,14 @@ class Tensor(OpMixin):
     """
     if not all_int([low, high]): raise TypeError(f"{low=} and {high=} must be integers")
     if not dtypes.is_int(dtype := to_dtype(dtype)): raise TypeError(f"{dtype=} must be int")
+    if low >= high: raise ValueError(f"Tensor.randint requires low < high, got {low=}, {high=}")
     return Tensor.uniform(*shape, low=low, high=high, dtype=dtype, **kwargs)
 
   @staticmethod
   def normal(*shape, mean=0.0, std=1.0, requires_grad:bool|None=None, **kwargs) -> Tensor:
     """
     Creates a tensor with the given shape, filled with random values from a normal distribution with the given `mean` and standard deviation `std`.
+    Requires `std >= 0`.
 
     You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
     Additionally, all other keyword arguments are passed to the constructor of the tensor.
@@ -719,12 +721,14 @@ class Tensor(OpMixin):
     print(Tensor.normal(2, 3, mean=10, std=2).numpy())
     ```
     """
+    if std < 0: raise ValueError(f"Tensor.normal requires std >= 0, got {std=}")
     return (std * Tensor.randn(*shape, **kwargs) + mean).requires_grad_(requires_grad)
 
   @staticmethod
   def uniform(*shape, low=0.0, high=1.0, dtype:DTypeLike|None=None, requires_grad:bool|None=None, **kwargs) -> Tensor:
     """
     Creates a tensor with the given shape, filled with random values from a uniform distribution over the interval `[low, high)`.
+    Requires `low < high`.
 
     You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
     Additionally, all other keyword arguments are passed to the constructor of the tensor.
@@ -734,6 +738,8 @@ class Tensor(OpMixin):
     print(Tensor.uniform(2, 3, low=2, high=10).numpy())
     ```
     """
+    if not all_int(shape:=argfix(*shape)) or not all(s >= 0 for s in shape): raise ValueError(f"invalid input {shape=}")
+    if low >= high: raise ValueError(f"Tensor.uniform requires low < high, got {low=}, {high=}")
     return (((high-low) * Tensor.rand(*shape, **kwargs)).cast(dtype or dtypes.default_float) + low).requires_grad_(requires_grad)
 
   @staticmethod
