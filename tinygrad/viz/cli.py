@@ -138,22 +138,24 @@ def main(args) -> None:
     timelines = [(n,l) for n,l in profile["layout"].items() if isinstance(l, dict) and l.get("event_type") == 0]
     def produce_top_kernels() -> Iterator[dict]:
       tagged = ((n,e) for n,l in timelines for e in l["events"]) if args.src == "ALL" else ((args.src,e) for e in unwrap(data)["events"])
-      agg:dict[tuple[str,str], tuple[float, int, int|None]] = {} # map (device, kernel name) to (total time, count and ref)
+      agg:dict[tuple[str,str], tuple[float, int, int|None, dict[str, float]]] = {} # map (device, kernel name) to (total time, count, ref, est)
+      est_keys = ("FLOPS", "B/s mem", "B/s lds")
       total = 0
       for dev,e in tagged:
         et = e["dur"] * 1e-3
-        t, c, ref = agg.get((dev,e["name"]), (0.0, 0, None))
-        agg[(dev,e["name"])] = (t+et, c+1, e["ref"])
+        t, c, ref, est = agg.get((dev,e["name"]), (0.0, 0, None, {}))
+        est.update({k:est.get(k, 0.0)+e["fmt"][k]*e["dur"]*1e-6 for k in est_keys if k in e["fmt"]})
+        agg[(dev,e["name"])] = (t+et, c+1, e["ref"], est)
         total += et
       items = sorted(agg.items(), key=lambda kv:kv[1][0], reverse=True)
       num_rows = len(items) if args.top < 0 else args.top
-      for (dev,name),(t,c,ref) in items[:num_rows]:
+      for (dev,name),(t,c,ref,est) in items[:num_rows]:
         display = f"{dev[:7]:7s} {fmt_colored(name)}" if args.src == "ALL" else fmt_colored(name)
-        yield {"name":display, "dur_ms":t, "count":c, "pct":t/total*100.0, "ref":ref}
+        yield {"name":display, "dur_ms":t, "count":c, "pct":t/total*100.0, "ref":ref, "fmt":{k:int(est[k]/(t*1e-3)) for k in est_keys if k in est}}
       if num_rows > 0 and items[num_rows:]:
-        other_t = sum(t for _,(t,_,_) in items[num_rows:])
-        other_c = sum(c for _,(_,c,_) in items[num_rows:])
-        yield {"name":"Other", "dur_ms":other_t, "count":other_c, "pct":other_t/total*100.0, "ref":None}
+        other_t = sum(t for _,(t,_,_,_) in items[num_rows:])
+        other_c = sum(c for _,(_,c,_,_) in items[num_rows:])
+        yield {"name":"Other", "dur_ms":other_t, "count":other_c, "pct":other_t/total*100.0, "ref":None, "fmt":None}
     def produce_all_kernels() -> Iterator[dict]:
       event_streams = [[(e["st"], n, e) for e in l["events"]] for n,l in timelines] if args.src == "ALL" \
                       else [[(e["st"], args.src, e) for e in unwrap(data)["events"]]]
@@ -175,7 +177,8 @@ def main(args) -> None:
         yield {"device":dev, "name":fmt_colored(e["name"]), "dur_ms":e["dur"]*1e-3,
                "st_ms":e["st"]*1e-3, "fmt":fmt, "ref":e["ref"], "ext":"\n".join(ext)}
     def fmt_top(k:dict) -> str:
-      return f"{fmt_colored(k['name'])}{' ' * max(0, 36-ansilen(k['name']))} {time_to_str(k['dur_ms']*1e-3, w=9)} {k['count']:7d} {k['pct']:6.2f}%"
+      return f"{fmt_colored(k['name'])}{' ' * max(0, 38-ansilen(k['name']))} {time_to_str(k['dur_ms']*1e-3, w=9)} {k['count']:7d} {k['pct']:6.2f}%"+\
+          (" "*4+fmt_data(k['fmt']) if k['fmt'] else "")
     def fmt_all(k:dict) -> str:
       if k["device"] in {"MARKER", "SOURCE"}: return f"--- {k['device']} {k['name']}"+(f"/{k['st_ms']:9.2f}ms" if k['st_ms'] else "")
       ptm = colored(time_to_str(k["dur_ms"]*1e-3, w=9), "yellow" if k["dur_ms"] > 10 else None)
