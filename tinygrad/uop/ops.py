@@ -971,7 +971,13 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     body = self if self.op is Ops.TUPLE else UOp.maketuple(self)
     return UOp(Ops.FUNCTION, dtypes.void, (body,)+srcs, CallInfo(grad_fxn, metadata, name, precompile, precompile_backward))
   def custom_kernel(*srcs:UOp, fxn:Callable, grad_fxn:Callable|None=None) -> list[UOp]:
-    contig_srcs = tuple(x.contiguous() if x.op is not Ops.AFTER else x for x in srcs)
+    _REALIZED = {Ops.AFTER, Ops.BUFFER, Ops.BUFFER_VIEW, Ops.PARAM}
+    def _is_realized_view(u):
+      if u.base.op not in _REALIZED: return False
+      cur = u
+      while cur.op in {Ops.RESHAPE, Ops.MULTI} and cur.src: cur = cur.src[0]
+      return cur.op in _REALIZED or u.contiguous_view_offset() is not None
+    contig_srcs = tuple(x if _is_realized_view(x) else x.contiguous() for x in srcs)
     placeholders = [UOp.placeholder_like(s, slot=i) for i,s in enumerate(contig_srcs)]
     kernel = fxn(*placeholders).call(*contig_srcs, grad_fxn=grad_fxn)
     return [s.after(kernel) for s in contig_srcs]
