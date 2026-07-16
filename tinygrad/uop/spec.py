@@ -128,6 +128,8 @@ def valid_gettuple(g:UOp, t:UOp):
 
 # these ops can exist in tensor but not programs. example: movement
 spec_tensor = PatternMatcher([
+  (UPat((Ops.SIN, Ops.LOG2, Ops.EXP2, Ops.SQRT, Ops.RECIPROCAL), src=(UPat(),), name="u"), lambda u: dtypes.is_float(u.dtype)),
+
   # BUFFER
   (UPat(Ops.BUFFER, src=(UPat(),), name="buf"), lambda buf:
    (isinstance(buf.dtype, DType) and buf.src[0].dtype == dtypes.index and is_device(buf.arg.device))
@@ -223,6 +225,8 @@ spec_hcq = PatternMatcher([
 
 # these are intermediate ops. everything should be deleted from here
 spec_full = PatternMatcher([
+  (UPat(Ops.REWRITE_ERROR, dtypes.void, name="x"), lambda x: isinstance(x.arg, str)),
+
   # SLICE on BUFFER is allowed if BUFFER is
   (UPat(Ops.SLICE, src=(UPat(GroupOp.Movement.union({Ops.BUFFER, Ops.PARAM, Ops.STAGE, Ops.AFTER})),
                         UPat(Ops.CONST, dtype=dtypes.index)), allow_any_len=True, name="bv"),

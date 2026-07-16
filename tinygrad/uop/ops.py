@@ -4,7 +4,7 @@ import sys, time, functools, itertools, math, operator, hashlib, os, types, pick
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from tinygrad.uop import Ops, GroupOp
-from tinygrad.dtype import ConstType, dtypes, DType, DTypeLike, to_dtype, truncate, least_upper_dtype, Invalid, AddrSpace
+from tinygrad.dtype import ConstType, dtypes, DType, DTypeLike, truncate, least_upper_dtype, least_upper_float, Invalid, AddrSpace
 from tinygrad.dtype import ConstFloat, PyConst, InvalidType, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
 from tinygrad.device import Buffer, MultiBuffer, canonicalize_device
 from tinygrad.helpers import ContextVar, all_int, prod, getenv, all_same, Context, partition, temp, unwrap, T, argfix, Metadata, flatten, TRACEMETA
@@ -119,10 +119,12 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType|None:
       return src[0].dtype
     case Ops.CMPLT | Ops.CMPNE | Ops.CMPEQ:
       return dtypes.bool
+    case Ops.SIN | Ops.LOG2 | Ops.EXP2 | Ops.SQRT | Ops.RECIPROCAL:
+      return dtypes.weakfloat if src[0].dtype == dtypes.weakint else least_upper_float(src[0].dtype)
     case Ops.WHERE:
       assert src[0].dtype == dtypes.bool, f"where first arg isn't bool, it's {src[0].dtype}"
-      assert src[1].dtype == src[2].dtype, f"dtype mismatch in where {src[1].dtype} != {src[2].dtype}"
-      return src[1].dtype
+      if src[1].dtype == src[2].dtype: return src[1].dtype
+      return least_upper_dtype(src[1].dtype, src[2].dtype)
     case Ops.STACK:
       if len(src) == 0: return dtypes.void
       if all_same(dts:=[x.dtype for x in src]): return dts[0]
@@ -159,9 +161,8 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType|None:
   if op in GroupOp.Unary: return src[0].dtype
   # NOTE: CMPLT, CMPNE, CMPEQ, WHERE, SHL, SHR are handled above
   if op in GroupOp.Broadcastable:
-    # TODO: support dtype broadcasting (promotion)
-    if not all_same([x.dtype for x in src]): raise RuntimeError(f"dtype mismatch in {op}")
-    return src[0].dtype
+    if all_same(dts:=[x.dtype for x in src]): return dts[0]
+    return least_upper_dtype(*dts)
   if op in GroupOp.Movement: return src[0].dtype
   raise RuntimeError(f"no dtype for {op} with arg {arg}")
 
@@ -446,9 +447,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     return tuple(x//len(self.device) if i == self.axis else x for i,x in enumerate(self.shape))
 
   @property
-  def max_shard_shape(self) -> tuple[int, ...]:
-    if not isinstance(self.device, tuple) or self.axis is None: return self.max_shape
-    return tuple(x//len(self.device) if i == self.axis else x for i,x in enumerate(self.max_shape))
+  def max_shard_shape(self) -> tuple[int, ...]: return to_max_shape(self.shard_shape)
 
   @functools.cached_property
   def ended_ranges(self) -> tuple[UOp, ...]:
@@ -560,13 +559,6 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def broadcast(self, count:int):
     if count == 1: return self
     return UOp(Ops.STACK, src=(self,)*count)
-  def cast(self, dtype:DTypeLike):
-    dtype = to_dtype(dtype)
-    if self.dtype == dtype: return self
-    return UOp(Ops.CAST, arg=dtype, src=(self,))
-  def bitcast(self, dtype:DTypeLike):
-    dtype = to_dtype(dtype)
-    return self if self.dtype == dtype else UOp(Ops.BITCAST, arg=dtype, src=(self,))
   def load(self, *src:UOp, **kwargs): return UOp(Ops.LOAD, src=(self,)+src, **kwargs)
   def store(self, src:UOp|ConstType, gate:UOp|None=None, **kwargs):
     srcs = (self, self.const_like(src) if not isinstance(src, UOp) else src) + ((gate,) if gate is not None else ())
@@ -629,11 +621,6 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if isinstance(arg, Ops): arg = (arg, 0)
     return UOp(Ops.REDUCE, src=(self,)+src, arg=arg, **kwargs)
 
-  def contiguous(self, *args, **kwargs):
-    if self.op is Ops.CONTIGUOUS: return self
-    if self.device is None: return self
-    if self.has_buffer_identity(): return self
-    return UOp(Ops.CONTIGUOUS, src=(self,)+args, **kwargs)
   def bufferize(self, *args, **kwargs): return UOp(Ops.STAGE, src=(self,)+args, **kwargs)
   def allreduce(self, op, device:str|tuple[str, ...]):
     assert isinstance(self.device, tuple), f"allreduce must be on tuple {self.device} isn't"
@@ -784,8 +771,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
       assert bdtype.fmt is not None, f"{bdtype=} has None fmt"
       ret = UOp.empty(shape:=get_shape(x), dtype=bdtype, device="PYTHON")
       data = struct.pack(f"{prod(shape)}{bdtype.fmt}", *[truncate[bdtype](bdtype.const(xi)) for xi in fully_flatten(x)])
-    # fake realize. if target device is PYTHON it needs bytearray to be writable
-    ret.buffer.allocate(memoryview(data if device != "PYTHON" else bytearray(data)))
+    ret.buffer.allocate(memoryview(bytearray(data))) # fake realize. buffer storage must be writable, and bytes isn't
     if ret.dtype != dtype: ret = ret.cast(dtype)
     return ret if ret.device == device else ret.copy_to_device(device)
   def clone(self, device=None) -> UOp:
@@ -836,17 +822,17 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     """If movement ops on a BUFFER collapse to a contiguous range, return `offset` in elements. Otherwise None."""
     from tinygrad.schedule.rangeify import pm_mops
     from tinygrad.uop.symbolic import symbolic
-    numel = self.numel()
-    out = graph_rewrite(self.flatten().index(UOp.range(numel, 0)), pm_mops+symbolic, name="contiguous_view_offset")
-    if out.op is not Ops.INDEX: return None
-    if len(out.src) == 1: return 0 if resolve(numel == 1, False) else None
-    idx, has_range = out.src[1], False
-    if idx.op is Ops.RANGE: return 0
-    if idx.op is Ops.ADD and idx.src[0].op is Ops.RANGE: idx, has_range = idx.src[1], True
-    if idx.op is Ops.CONST and (has_range or resolve(numel == 1, False)):
-      if not isinstance(idx.arg, int): return None  # masked/padded regions produce InvalidType
-      return idx.arg
-    return None
+
+    # WEBGPU and CL do not support views.
+    # WEBGPU requires that minUniformBufferOffsetAlignment be at least 32 bytes: https://gpuweb.github.io/gpuweb/#adapter-capability-guarantees
+    # CL 1.1 provides the clCreateSubBuffer API, but at the time of writing, relevant CL runtimes (rusticl, adreno, nvidia, amd) do not provide
+    # reasonable values for CL_DEVICE_MEM_BASE_ADDR_ALIGN. cl_ext_buffer_device_address could potentially help, but this extension is not provided
+    # by relevant CL runtimes at time of writing.
+    if any(d.startswith(("WEBGPU", "CL")) for d in ((self.device,) if isinstance(self.device, str) else self.device)): return None
+
+    idx = self.flatten().index(UOp.range(self.numel(), 0))
+    out = graph_rewrite(idx, pm_mops+symbolic+pm_contiguous_view_offset, ctx=self, name="contiguous_view_offset")
+    return out.arg if out.op is Ops.CONST and isinstance(out.arg, int) else None
 
   def has_buffer_identity(self):
     """Check if this UOp has a concrete buffer identity in the graph (RESHAPE/MULTI -> BUFFER chain)."""
@@ -1216,7 +1202,7 @@ def exec_alu(op:Ops, dtype:DType, operands, truncate_output=True):
   if any(isinstance(x, tuple) for x in operands):
     count = max(len(x) for x in operands if isinstance(x, tuple))
     return tuple([exec_alu(op, dtype, [x[i] if isinstance(x, tuple) else x for x in operands]) for i in range(count)])
-  if dtype==dtypes.index and op in GroupOp.Binary and Invalid in operands: return Invalid
+  if op in GroupOp.Binary and Invalid in operands: return Invalid
   alu = python_alu[op](*operands)
   if truncate_output and (truncate_fxn:=truncate.get(dtype)) is not None: return truncate_fxn(alu)
   return alu
@@ -1725,6 +1711,14 @@ def do_unbind(ctx:dict[Variable, int], x:UOp):
   ctx[v] = i
   return v
 pm_unbind = PatternMatcher([(UPat(Ops.BIND, name="x"), do_unbind)])
+
+# ctx is source UOp for which we are finding a contiguous view for. used in contiguous_view_offset
+pm_contiguous_view_offset = PatternMatcher([
+  (UPat(Ops.INDEX, src=(UPat(),)), lambda: UOp.const(dtypes.index, 0)),
+  (UPat(Ops.INDEX, src=(UPat(), UPat(Ops.RANGE))), lambda: UOp.const(dtypes.index, 0)),
+  (UPat(Ops.INDEX, src=(UPat(), UPat(Ops.RANGE)+UPat.cvar('c'))), lambda c: c),
+  (UPat(Ops.INDEX, src=(UPat(), UPat.cvar('c'))), lambda ctx, c: c if resolve(ctx.numel() == 1, False) else None),
+])
 
 # *** what was symbolic.py ***
 

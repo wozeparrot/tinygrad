@@ -442,7 +442,8 @@ def fold_binary(buf:UOp, blob:UOp) -> UOp:
 
 def fold_const_store(buf:UOp, off:UOp, val:UOp) -> UOp:
   for b, v in zip((bs:=mb.bufs if isinstance((mb:=buf.buffer), MultiBuffer) else (mb,)), val.src if val.op is Ops.STACK else (val,)*len(bs)):
-    struct.pack_into(f'<{v.dtype.fmt}', b.ensure_allocated()._buf.cpu_view().mv.cast('B'), off.arg * buf.dtype.itemsize, truncate[v.dtype](v.arg))
+    data = struct.pack(f'<{v.dtype.fmt}', truncate[v.dtype](v.arg))
+    b.ensure_allocated()._buf.cpu_view().view(offset=off.arg * buf.dtype.itemsize, size=len(data), fmt='B')[:] = data
   return UOp(Ops.NOOP)
 
 def resolve_getaddr(buf:UOp, g:UOp) -> UOp:
@@ -573,6 +574,10 @@ class HCQ2Buffer:
   def base(self) -> HCQ2Buffer: return self._base or self
 
 class HCQAllocator(LRUAllocator[HCQDeviceType], Generic[HCQDeviceType]):
+  def _as_buffer(self, buf:HCQ2Buffer) -> memoryview:
+    self.dev.synchronize()
+    return buf.cpu_view().mv
+
   def _map(self, buf:HCQ2Buffer) -> HCQ2Buffer:
     if not hasattr(self, '_do_map'): raise NotImplementedError("map failed: no method implemented")
     return self._do_map(buf)
@@ -588,24 +593,3 @@ class HCQAllocator(LRUAllocator[HCQDeviceType], Generic[HCQDeviceType]):
     self.dev.iface.free(mb)
 
   def _offset(self, buf, size:int, offset:int) -> HCQ2Buffer: return buf.offset(offset=offset, size=size)
-
-  def _wrap(self, dev:str, sz:int, opaque:HCQ2Buffer) -> Buffer:
-    return Buffer(dev, sz, dtypes.uint8, opaque=opaque, options=BufferSpec(external_ptr=1))
-
-  def _copy(self, dst:Buffer, src:Buffer):
-    from tinygrad.engine.realize import run_linear
-    du, su = UOp.from_buffer(dst), UOp.from_buffer(src)
-    run_linear(UOp(Ops.LINEAR, src=(su.param_like(1).copy_to_device(dst.device).call(du, su),)), update_stats=True)
-
-  def _copyin(self, dest:HCQ2Buffer, src:memoryview):
-    s = Buffer(self.dev.device, len(src), dtypes.uint8, options=BufferSpec(host=True), preallocate=True)
-    s._buf.cpu_view()[:len(src)] = src
-    self._copy(self._wrap(self.dev.device, len(src), dest), s)
-
-  def _copyout(self, dest:memoryview, src:HCQ2Buffer):
-    d = Buffer(self.dev.device, len(dest), dtypes.uint8, options=BufferSpec(host=True), preallocate=True)
-    self._copy(d, self._wrap(self.dev.device, len(dest), src))
-    self.dev.synchronize()
-    dest[:] = d._buf.cpu_view()[:len(dest)]
-
-  # def _as_buffer(self, buf): return buf.cpu_view().mv
