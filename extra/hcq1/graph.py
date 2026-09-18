@@ -16,6 +16,11 @@ class HCQGraph(MultiGraphRunner):
     # CPU Device is always last
     self.devices = sorted(self.devices, key=lambda x: 1 if x._is_cpu() else 0)
 
+    self.reorder_enabled = bool(getenv("HCQ_REORDER", 0))
+    if self.reorder_enabled:
+      from extra.hcq1.schedule import reorder_graph
+      reorder_graph(self)
+
     # Replace input buffers with variables.
     self.hcq_bufs = [[b._buf for b in bufs] for (_,_,bufs,_) in self.calls]
     self.input_replace_to_var: dict[tuple[int, int], Variable] = {}
@@ -107,7 +112,9 @@ class HCQGraph(MultiGraphRunner):
         self.rdma_queues.setdefault(rdma_key, RDMACopyQueue(enqueue_dev.rdma_dev()))
       else:
         assert (enqueue_dev.hw_copy_queue_t is not None), "device must implement a copy queue"
-        queue_idx = self.devices.index(cast(HCQCompiled, Device[bufs[0].device])) % self.num_copy_queues
+        from extra.hcq1.schedule import copy_queue_index
+        queue_idx = copy_queue_index(self.devices, enqueue_dev, Device[bufs[0].device], bufs[0].nbytes,
+                                     self.num_copy_queues, small_copies=self.reorder_enabled)
         enqueue_queue = self.copy_queues.setdefault((enqueue_dev, queue_idx),
           enqueue_dev.hw_copy_queue_t(queue_idx=queue_idx).wait(self.kick_signals[enqueue_dev.peer_group], self.kickoff_var))
 
@@ -125,7 +132,11 @@ class HCQGraph(MultiGraphRunner):
         self.rdma_deps[j] = (peer_queue, peer_sync_signals + peer_opt_deps, peer_out_signal, j + 1)
         self.last_j[peer_queue] = j
       else:
-        sync_signals, opt_deps, rdeps = self._resolve_deps(bufs, ast.arg.outs if runtime is not None else [0], enqueue_queue,
+        outs = ast.arg.outs if runtime is not None else [0]
+        if self.reorder_enabled:
+          from extra.hcq1.schedule import write_slots
+          outs = write_slots(ast, bufs)
+        sync_signals, opt_deps, rdeps = self._resolve_deps(bufs, outs, enqueue_queue,
           enqueue_dev, out_signal, j, is_copy=is_xfer)
 
       self.ji_schedule[j] = (enqueue_dev, enqueue_queue, sync_signals, opt_deps[::-1], out_signal, None if runtime is not None else (j + 1))

@@ -67,6 +67,12 @@ def call_gradient(ctx:UOp, k:UOp, needed:set[int]) -> tuple[UOp|None, ...]:
   ret_set = set(ret_pos)
   return (None,) + tuple(None if i in ret_set else (bwd_outs[gb_map[i]] if i in gb_map else None) for i in range(len(args)))
 
+def unshard_gradient(ctx:UOp, ret:UOp):
+  # A gradient already owned by the same shards needs no COPY/all-reduce to reconstruct the full tensor.
+  if ret.axis is not None and ctx.device == ret.device and ctx.axis == ret.axis:
+    return ctx._shard(ret.axis, ret.src[1]), ret.src[1]
+  return ctx.shard(ret.device, ret.axis).src
+
 def partial_store_gradient(ctx:UOp, dest:UOp, view:UOp):
   # A write through a non-overlapping view replaces only that region of the returned state.
   path, base = [], view
@@ -108,7 +114,7 @@ pm_gradient = PatternMatcher([
   (UPat(Ops.FLIP, name="ret"), lambda ctx, ret: (ctx.flip([i for i,x in enumerate(ret.marg) if x]),)),
   (UPat(Ops.STACK, name="ret"), lambda ctx, ret: tuple(ctx[i] for i in range(len(ret.src)))),
   (UPat(Ops.COPY, name="ret"), lambda ctx, ret: (ctx.copy_to_device(ret.src[0].device),)),
-  (UPat(Ops.UNSHARD, name="ret"), lambda ctx, ret: ctx.shard(ret.device, ret.axis).src),
+  (UPat(Ops.UNSHARD, name="ret"), unshard_gradient),
   (UPat(Ops.SINK), lambda ctx: ctx.src),
   (UPat(Ops.AFTER, src=(UPat.var("d"), UPat(Ops.CALL, name="k"))), lambda ctx, d, k:
     (ctx, UOp.sink(*([ctx if i == k.src.index(d)-1 else UOp(Ops.NOOP) for i in range(len(k.src)-1)])))),

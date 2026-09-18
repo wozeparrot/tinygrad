@@ -11,6 +11,9 @@ using namespace kittens;
 #ifndef ROUTER_E
 #define ROUTER_E 32
 #endif
+#ifndef ROUTER_DBUF
+#define ROUTER_DBUF 0
+#endif
 
 constexpr int BLOCK_M = 64;
 constexpr int BLOCK_K = 64;
@@ -34,8 +37,13 @@ extern "C" __global__ __launch_bounds__(THREADS, 4) void moe_router_mfma(
   gl<bf16, 1, 1, ROUTER_M, ROUTER_K> X{x_ptr, nullptr, nullptr, nullptr, nullptr};
   gl<bf16, 1, 1, ROUTER_E, ROUTER_K> W{weight_ptr, nullptr, nullptr, nullptr, nullptr};
 
+#if ROUTER_DBUF
+  __shared__ XST Xs[2];
+  __shared__ WST Ws[2];
+#else
   __shared__ XST Xs;
   __shared__ WST Ws;
+#endif
 
   XRT xr;
   WRT wr;
@@ -45,6 +53,36 @@ extern "C" __global__ __launch_bounds__(THREADS, 4) void moe_router_mfma(
   const int block_m = __builtin_amdgcn_workgroup_id_x();
   const int warp_m = warpid();
 
+#if ROUTER_DBUF
+  // Keep the MFMA accumulation order unchanged while hiding the next global-to-LDS
+  // transfer behind the current tile's matrix multiply.
+  G::load(Xs[0], X, {0, 0, block_m, 0});
+  G::load(Ws[0], W, {0, 0, 0, 0});
+  asm volatile("s_waitcnt vmcnt(0)");
+  asm volatile("s_waitcnt lgkmcnt(0)");
+  __builtin_amdgcn_s_barrier();
+  #pragma unroll
+  for (int kk = 0; kk < ROUTER_K / BLOCK_K; kk++) {
+    const int cur = kk & 1;
+    const int next = cur ^ 1;
+    load(xr, subtile_inplace<16, BLOCK_K>(Xs[cur], {warp_m, 0}));
+    load(wr, subtile_inplace<ROUTER_E, BLOCK_K>(Ws[cur], {0, 0}));
+    asm volatile("s_waitcnt lgkmcnt(0)");
+    if (kk + 1 < ROUTER_K / BLOCK_K) {
+      G::load(Xs[next], X, {0, 0, block_m, kk + 1});
+      G::load(Ws[next], W, {0, 0, 0, kk + 1});
+    }
+    __builtin_amdgcn_s_setprio(1);
+    mma_ABt(accum, xr, wr, accum);
+    __builtin_amdgcn_s_setprio(0);
+    __builtin_amdgcn_sched_barrier(0);
+    if (kk + 1 < ROUTER_K / BLOCK_K) {
+      asm volatile("s_waitcnt vmcnt(0)");
+      asm volatile("s_waitcnt lgkmcnt(0)");
+      __builtin_amdgcn_s_barrier();
+    }
+  }
+#else
   #pragma unroll
   for (int kk = 0; kk < ROUTER_K / BLOCK_K; kk++) {
     G::load(Xs, X, {0, 0, block_m, kk});
@@ -62,6 +100,7 @@ extern "C" __global__ __launch_bounds__(THREADS, 4) void moe_router_mfma(
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
   }
+#endif
 
   // A 16x16 MFMA accumulator is column-layout: each lane owns four consecutive rows
   // at one column. Store all 64x32 FP32 results directly; no padded or undersized output ABI.

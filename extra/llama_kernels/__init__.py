@@ -1,7 +1,7 @@
 from __future__ import annotations
 import functools, pathlib
 from tinygrad import Tensor
-from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+from extra.hipcc import HIPCCCompiler
 
 FP8_MAX = 448.0
 NUM_WG, THREADS_PER_WG = 1024, 256
