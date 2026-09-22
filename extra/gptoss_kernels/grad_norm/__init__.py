@@ -21,7 +21,7 @@ def _custom_sum_squares(partial:UOp, x:UOp, *, dname:str) -> UOp:
   return UOp(Ops.PROGRAM,
              src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=compile_hip(src, defines))))
 
-def sum_squares_bf16(x:Tensor) -> Tensor:
+def sum_squares_bf16(x:Tensor, *, local:bool=False) -> Tensor:
   assert x.dtype == dtypes.bfloat16
   device = x.device
   axis = x.uop.axis if isinstance(device, tuple) else None
@@ -30,4 +30,7 @@ def sum_squares_bf16(x:Tensor) -> Tensor:
   partial = alloc_like((n_partials * len(device),), dtypes.float32, device, 0) \
     if isinstance(device, tuple) and axis is not None else alloc_like((n_partials,), dtypes.float32, device)
   partial, *_ = Tensor.custom_kernel(partial, x, fxn=functools.partial(_custom_sum_squares, dname=dname_of(device)))
+  if local:
+    assert isinstance(device, tuple) and axis is not None
+    return partial.reshape(len(device), n_partials).sum(1)
   return partial.sum()

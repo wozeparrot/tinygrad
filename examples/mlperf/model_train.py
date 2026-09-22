@@ -1669,18 +1669,24 @@ def train_llama3():
         MLLOGGER.start(key=mllog_constants.BLOCK_START, metadata={mllog_constants.SAMPLES_COUNT: sequences_seen})
 
 def train_gptoss():
+  import gc
+  from itertools import islice
   from examples.mlperf.models.gpt_oss import GPTOSS, GPT_OSS_20B, apply_grad, FP8_DTYPE
   from examples.mlperf.lr_schedulers import CosineAnnealingLRWithWarmup
-  from examples.mlperf.optim import GradAccClipAdamW, GradAccClipAdamWGroup, fclip_grads
+  from examples.mlperf.optim import GradAccClipAdamW, GradAccClipAdamWGroup, clip_grads_lazy
 
   BENCHMARK = getenv("BENCHMARK")
 
   config = {}
+  STEP_GROUP = config["GPTOSS_STEP_GROUP"] = getenv("GPTOSS_STEP_GROUP", 1)
+  assert STEP_GROUP in (1, 2, 4), "GPTOSS_STEP_GROUP must be 1, 2 or 4; each member is a separate optimizer update"
   BASEDIR            = config["BASEDIR"]                = Path(getenv("BASEDIR", "/raid/datasets/c4-8b/"))
   BS                 = config["BS"]                     = getenv("BS", 16)
-  GBS                = config["GLOBAL_BATCH_SIZE"]      = BS
-  SEED               = config["SEED"]                   = getenv("SEED", 5760)
-  DATA_SEED          = config["DATA_SEED"]              = getenv("DATA_SEED", SEED)
+  grad_acc           = config["GRADIENT_ACC_STEPS"]     = getenv("GRADIENT_ACC_STEPS", 1)
+  GBS                = config["GLOBAL_BATCH_SIZE"]      = BS * grad_acc
+  assert grad_acc == 1, "GPT-OSS uses one minibatch per optimizer step; gradient accumulation is not supported"
+  SEED               = config["SEED"]                   = getenv("SEED", random.SystemRandom().randint(0, 2**32 - 1))
+  DATA_SEED          = config["DATA_SEED"]              = getenv("DATA_SEED", 5760)
   SEQLEN             = config["SEQLEN"]                 = getenv("SEQLEN", 8192)
   TRAIN_ON_VAL       = config["TRAIN_ON_VAL"]           = getenv("TRAIN_ON_VAL", 0)
   MAX_STEPS          = config["MAX_STEPS"]              = getenv("MAX_STEPS", 1_200_000)
@@ -1740,13 +1746,28 @@ def train_gptoss():
   params_wd = [p for p in params if p.ndim >= 3]
   params_no_wd = [p for p in params if p.ndim < 3]
   optim = GradAccClipAdamWGroup(
-    GradAccClipAdamW(params_wd, lr=0.0, b1=opt_adamw_beta_1, b2=opt_adamw_beta_2, eps=opt_adamw_epsilon, weight_decay=opt_adamw_weight_decay, grad_acc=1, device=optim_device),
-    GradAccClipAdamW(params_no_wd, lr=0.0, b1=opt_adamw_beta_1, b2=opt_adamw_beta_2, eps=opt_adamw_epsilon, weight_decay=0.0, grad_acc=1, device=optim_device),
+    GradAccClipAdamW(params_wd, lr=0.0, b1=opt_adamw_beta_1, b2=opt_adamw_beta_2, eps=opt_adamw_epsilon, weight_decay=opt_adamw_weight_decay, grad_acc=grad_acc, device=optim_device),
+    GradAccClipAdamW(params_no_wd, lr=0.0, b1=opt_adamw_beta_1, b2=opt_adamw_beta_2, eps=opt_adamw_epsilon, weight_decay=0.0, grad_acc=grad_acc, device=optim_device),
   )
 
+  # Match gradient destinations to the optimizer-owned rows: expert rows for MoE, and optionally vocabulary
+  # rows for the fused LM-head and embedding backwards. Stacked attention weights still require replicated gradients because
+  # their per-layer index is incompatible with sharding that axis.
+  zero2_active = getenv("ZERO2", 0) and getenv("ZERO_OPTIM", 0)
+  zero2_lmhead = zero2_active and getenv("GPTOSS_ZERO2_LMHEAD", 0)
+  zero2_embedding = zero2_active and getenv("GPTOSS_ZERO2_EMBEDDING", 0)
+  if zero2_embedding: assert getenv("GPTOSS_EMBEDDING", 0), "Embedding ZeRO-2 requires the custom GPT-OSS embedding"
+  if zero2_lmhead:
+    assert getenv("FUSED_LINEAR_CE", 0) and getenv("LINEAR_CE_DUAL_MX_BWD", 0), "LM-head ZeRO-2 requires the dual-MX fused loss"
   for p in optim.params:
-    p.grad = p.zeros_like(dtype=dtypes.bfloat16 if p.dtype == FP8_DTYPE else p.dtype).contiguous()
-    if getattr(p, "_zero2", False): p.grad = optim.optimizers[0]._zero_shard(p.grad)
+    grad_dtype = dtypes.bfloat16 if p.dtype == FP8_DTYPE else p.dtype
+    # Gradient destinations need owned storage before their first write; CONTIGUOUS is only a layout request.
+    g = p.zeros_like(dtype=grad_dtype).clone()
+    shard_grad = (zero2_active and getattr(p, "_zero2_moe", False)) or (zero2_lmhead and p is model.output)
+    shard_grad |= bool(zero2_embedding and p is model.tok_embeddings.weight)
+    if shard_grad and isinstance(p.device, tuple) and p.shape[0] % len(p.device) == 0:
+      g = optim.optimizers[0]._zero_shard(g)   # axis 0 matches the reduced gradient and optimizer state
+    p.grad = g
   grads = [p.grad for p in optim.params]
 
   from extra.gemm.cdna_asm_gemm import _mx_block_scale
@@ -1777,40 +1798,81 @@ def train_gptoss():
         w._wT_q, w._wT_e8 = model_state[wtq_name], model_state[wte_name]
         fp8_wT_tensors += [w._wT_q, w._wT_e8]
 
+  fp8_fc1_si_tensors = []
+  if getenv("PREPACK_FC1_WSI", 0):
+    for wname in fp8_scale_names:
+      if "w_gate_up" not in wname: continue
+      base, dot, idx = wname.rpartition(".")
+      si_name = f"{base}_si.{idx}" if dot else f"{wname}_si"
+      if si_name in model_state:
+        w = model_state[wname]
+        w._fc1_packed_si = model_state[si_name]
+        fp8_fc1_si_tensors.append(w._fc1_packed_si)
+
   scheduler = CosineAnnealingLRWithWarmup(optim, opt_base_learning_rate, opt_end_learning_rate, opt_learning_rate_warmup_steps, opt_learning_rate_decay_steps)
 
   if optim.master_params:
     for m in optim.master_params: m.realize()
-  Tensor.realize(*optim.params, *fp8_inv_scales, *fp8_wT_tensors)
+  Tensor.realize(*optim.params, *fp8_inv_scales, *fp8_wT_tensors, *fp8_fc1_si_tensors)
 
-  @TinyJit
+  from examples.mlperf.gptoss_training import DeferredLMHead, next_group_size, gptoss_model_flops, gptoss_mfu, MI350X_FP8_FLOPS
+  deferred_lmhead = DeferredLMHead(optim, model.output) if getenv("DEFERRED_LMHEAD", 0) else None
+
   @Context(TRAINING=1)
-  def step(tokens:Tensor):
+  def train_math(tokens:Tensor):
+    model._deferred_lmhead = deferred_lmhead
     if is_dp: tokens = tokens.to(None).shard(device, 0)
     if not is_sharding: tokens = tokens.to(None)
-
-    logits:Tensor = model(tokens[:, :-1], save=True)
-    if getenv("FUSED_CE", 0):
-      from extra.llama_kernels.fused_ce import fused_ce_loss
-      loss = fused_ce_loss(logits.cast(dtypes.bfloat16), tokens[:, 1:], label_smoothing=0.0)
+    if getenv("FUSED_LINEAR_CE", 0):
+      loss = model(tokens[:, :-1], save=True, targets=tokens[:, 1:])
     else:
-      loss = logits.sparse_categorical_crossentropy(tokens[:, 1:])
+      logits:Tensor = model(tokens[:, :-1], save=True)
+      if getenv("FUSED_CE", 0):
+        from extra.llama_kernels.fused_ce import fused_ce_loss
+        loss = fused_ce_loss(logits.cast(dtypes.bfloat16), tokens[:, 1:], label_smoothing=0.0)
+      else:
+        loss = logits.sparse_categorical_crossentropy(tokens[:, 1:])
 
     for g, new_g in zip(grads, loss.gradient(*optim.params)):
-      apply_grad(g, new_g.uop)
+      apply_grad(g, new_g.uop, accumulate=False)
 
-    Tensor.realize(loss, *grads)
-
-    clipped_grads, grad_norm = fclip_grads(grads, 1.0)
+    # One minibatch per step: overwrite each grad slice instead of adding to a zeroed accumulation buffer.
+    # Keep the pre-update loss on GPU until step completion; a mid-step host copy blocks backward graph submission.
+    loss_gpu = loss.flatten().float().contiguous()
+    Tensor.realize(loss_gpu, *grads)
+    clipped_grads, grad_norm = clip_grads_lazy(grads, 1, 1.0)
     optim.fstep(clipped_grads, grad_norm)
     scheduler.step()
 
-    loss_cpu = loss.flatten().float().to("CPU")
-    lr_cpu = optim.lr.float().to("CPU")
-    grad_norm_cpu = grad_norm.float().to("CPU")
-    Tensor.realize(loss_cpu, lr_cpu, grad_norm_cpu, *grads, *fp8_inv_scales)
+    return loss_gpu, grad_norm
 
+  @TinyJit
+  @Context(TRAINING=1)
+  def train_step(tokens:Tensor):
+    loss_gpu, grad_norm = train_math(tokens)
+    # Materialize scalar producers before the host transfer. The outer loop waits for the asynchronous GPU work.
+    loss_cpu = loss_gpu.to("CPU")
+    lr_cpu = optim.lr.float().contiguous().to("CPU")
+    grad_norm_cpu = grad_norm.float().contiguous().to("CPU")
+    Tensor.realize(loss_cpu, lr_cpu, grad_norm_cpu, *grads, *fp8_inv_scales)
     return loss_cpu, lr_cpu, grad_norm_cpu
+
+  @Context(TRAINING=1)
+  def grouped_math(*batches):
+    # All host copies precede model work; every minibatch still updates weights/LR.
+    inputs = tuple(t.to(None).contiguous() for t in batches)
+    Tensor.realize(*inputs)
+    saved = []
+    for tokens in inputs:
+      loss_gpu, grad_norm = train_math(tokens)
+      lr_saved, grad_norm_saved = optim.lr.float().clone(), grad_norm.float().clone()
+      Tensor.realize(loss_gpu, lr_saved, grad_norm_saved, *grads, *fp8_inv_scales)
+      saved.extend((loss_gpu, lr_saved, grad_norm_saved))
+    metrics = tuple(t.to("CPU") for t in saved)
+    Tensor.realize(*metrics)
+    return metrics
+
+  train_group = TinyJit(grouped_math)
 
   @TinyJit
   @Context(TRAINING=0)
@@ -1819,12 +1881,13 @@ def train_gptoss():
     if not is_sharding: tokens = tokens.to(None)
     logits:Tensor = model(tokens[:, :-1])
     loss = logits.sparse_categorical_crossentropy(tokens[:, 1:])
-    return loss.flatten().float().to("CPU")
+    return loss.flatten().float().contiguous().to("CPU")
 
   # ** data iters **
   def fake_data(bs, samples):
     import numpy as np
     for _ in range(samples // bs):
+      np.random.seed(getenv("DATA_SEED", 5760))  # TEST: deterministic fake data for tg10/tg11 comparison
       fake_data_np = np.random.randint(0, real_vocab_size, size=(bs, SEQLEN + 1), dtype=np.int32)
       yield Tensor(fake_data_np, device="NPY")
 
@@ -1847,107 +1910,150 @@ def train_gptoss():
     from examples.mlperf.dataloader import iterate_llama3_dataset
     return iterate_llama3_dataset(eval_dataset, EVAL_BS)
 
-  num_params = sum(p.numel() for p in params) - model_params["vocab_size"]*model_params["dim"]
+  model_flops = gptoss_model_flops(model, batch_size=GBS, seqlen=SEQLEN)
+  metric_basis = "useful model GEMMs; active experts; logical dimensions; causal/window attention; capture wall time"
+  print(f"MFU model work: {model_flops/1e15:.6f} PFLOP/node/update ({metric_basis}); "
+        f"MFU uses {MI350X_FP8_FLOPS/1e15:.3f} PFLOP/s/GPU MI350X dense FP8 peak")
+  print("GFLOPS: GlobalCounters.global_ops / 1e9 / dev_time (node-wide kernel estimates)")
+  if WANDB:
+    wandb.config.update({"mfu_metric_basis": metric_basis, "gflops_metric_basis": "GlobalCounters.global_ops / 1e9 / dev_time",
+                        "model_flops_per_update": model_flops,
+                        "mfu_peak_flops_per_gpu": MI350X_FP8_FLOPS})
   train_iter = get_train_iter()
   i, sequences_seen = 0, 0
   step_times = []
+  group_calls = 0
 
-  while i < MAX_STEPS:
-    GlobalCounters.reset()
-    actual_gbs = GBS if i >= 2 else BS
-    if getenv("TRAIN", 1):
-      profile_marker(f"train @ {i}")
-      st = time.perf_counter()
+  try:
+    while i < MAX_STEPS:
+      GlobalCounters.reset()
+      if getenv("TRAIN", 1):
+        profile_marker(f"train @ {i}")
+        st = time.perf_counter()
 
-      ist = time.perf_counter()
+        ist = time.perf_counter()
+        count = next_group_size(step=i, sequences=sequences_seen, batch_size=BS, group_size=STEP_GROUP,
+                                max_steps=MAX_STEPS, eval_freq=EVAL_FREQ, checkpoint_freq=getenv("CKPT"), benchmark_steps=BENCHMARK)
+        # TinyJit's uncaptured first call may have different inputs from capture.
+        # Warm one update, then capture STEP_GROUP updates on the second call.
+        if STEP_GROUP > 1 and group_calls == 0: count = min(count, 1)
+        batches = tuple(islice(train_iter, count))
+        if not batches: break
+        count = len(batches)
+        mst = time.perf_counter()
+        data_time = mst - ist
 
-      try: tokens = next(train_iter)
-      except StopIteration: break
-      mst = time.perf_counter()
-      data_time = mst - ist
+        if STEP_GROUP == 1:
+          ret = train_step(batches[0])
+        elif count == STEP_GROUP or group_calls == 0:
+          ret = train_group(*batches)
+          group_calls += 1
+        else:
+          # Eager short groups share persistent state without a second large capture.
+          ret = grouped_math(*batches)
+        if deferred_lmhead is not None: deferred_lmhead.mark_updated()
+        for dev in device: Device[dev].synchronize()
+        if STEP_GROUP == 1 and i == 1 and train_step.captured is not None: gc.collect()
+        if STEP_GROUP > 1 and count == STEP_GROUP and group_calls == 2 and train_group.captured is not None: gc.collect()
+        values = [t.item() for t in ret]
+        assert len(values) == 3*count and all(math.isfinite(v) for v in values), "Non-finite GPT-OSS training metrics"
+        metrics = [values[j:j+3] for j in range(0, len(values), 3)]
+        et = time.perf_counter()
 
-      ret = step(tokens)
-      dev_time = time.perf_counter() - mst
+        train_time = et - mst
+        dev_time = train_time
+        step_time = et - st
+        print("GPTOSS_CAPTURE", __import__("json").dumps(dict(first_update=i+1, updates=count,
+          wall_s=step_time, train_s=train_time, data_s=data_time, metrics=metrics, group_calls=group_calls,
+          configured_group=STEP_GROUP, eager_partial=(count != STEP_GROUP and group_calls > 1))), flush=True)
+        if BENCHMARK: step_times.extend([step_time/count]*count)
 
-      loss, lr, grad_norm = ret[0].item(), ret[1].item(), ret[2].item()
-      et = time.perf_counter()
+        mem_gb = GlobalCounters.mem_used / 1e9
+        gflops = GlobalCounters.global_ops / 1e9 / dev_time
+        mfu = gptoss_mfu(model_flops, updates=count, wall_s=step_time, device_count=device_count)
+        time_label = "step" if STEP_GROUP == 1 else f"amortized/update ({count}-update capture)"
+        for loss, lr, grad_norm in metrics:
+          i += 1
+          sequences_seen += BS
+          tqdm.write(
+              f"{i:5} {step_time/count:.3f} s {time_label}, {train_time/count:.3f} s train, {data_time/count:.3f} s data, {loss:.4f} loss, " \
+              f"{lr:.12f} LR, {grad_norm:.6f} grad_norm, {mem_gb:.2f} GB used, "
+              f"{gflops:9.2f} GFLOPS, {mfu:5.2f}% MFU (FP8 peak)")
+          if DEBUG >= 1: tqdm.write("  mem per device: " + ', '.join(f"{dev}: {mem/1e9:.2f} GB" for dev, mem in sorted(GlobalCounters.mem_used_per_device.items())))
 
-      step_time = et - st
-      if BENCHMARK: step_times.append(step_time)
+          if WANDB:
+            wandb.log({
+              "train/loss": loss,
+              "train/lr": lr,
+              "train/grad_norm": grad_norm,
+              **({"train/step_time": step_time, "train/train_time": train_time,
+                  "train/dev_time": dev_time, "train/data_time": data_time} if STEP_GROUP == 1 else
+                 {"train/capture_wall_time": step_time, "train/updates_per_capture": count,
+                  "train/wall_time_per_update_amortized": step_time/count,
+                  "train/train_time_per_update_amortized": train_time/count,
+                  "train/data_time_per_update_amortized": data_time/count}),
+              "train/mem": mem_gb,
+              "train/GFLOPS": gflops,
+              "train/MFU": mfu,
+              "train/sequences_seen": sequences_seen,
+              "train/optimizer_step": i
+            })
 
-      i += 1
-      sequences_seen += actual_gbs
-
-      mem_gb = GlobalCounters.mem_used / 1e9
-      gflops = GlobalCounters.global_ops / 1e9 / dev_time
-      mfu = ((6 * num_params * SEQLEN * GBS) / (dev_time * device_count * 4.6e15)) * 100
-      tqdm.write(
-          f"{i:5} {step_time:.3f} s step, {dev_time:.3f} s dev, {data_time:.3f} s data, {loss:.4f} loss, " \
-          f"{lr:.12f} LR, {grad_norm:.6f} grad_norm, {mem_gb:.2f} GB used, {gflops:9.2f} GFLOPS, {mfu:5.2f}% MFU")
-      if DEBUG >= 1: tqdm.write("  mem per device: " + ', '.join(f"{dev}: {mem/1e9:.2f} GB" for dev, mem in sorted(GlobalCounters.mem_used_per_device.items())))
-
-      if WANDB:
-        wandb.log({
-          "train/loss": loss,
-          "train/lr": lr,
-          "train/grad_norm": grad_norm,
-          "train/step_time": step_time,
-          "train/dev_time": dev_time,
-          "train/data_time": data_time,
-          "train/mem": mem_gb,
-          "train/GFLOPS": gflops,
-          "train/MFU": mfu,
-          "train/sequences_seen": sequences_seen
-        })
-
-      if (ckpt_freq := getenv("CKPT")) and (i % ckpt_freq == 0 and (i != 1 or ckpt_freq == 1)):
-        tqdm.write("saving checkpoint")
-        if not os.path.exists(ckpt_dir := "./ckpts"): os.mkdir(ckpt_dir)
-        fn = f"{ckpt_dir}/gptoss_{i}.safe"
-        safe_save(get_state_dict(model), fn)
-
-        tqdm.write("saving optim checkpoint")
-        fn = f"{ckpt_dir}/gptoss_{i}_optim.safe"
-        safe_save(get_state_dict(scheduler), fn)
-
-      if i == BENCHMARK:
-        median_step_time = sorted(step_times)[BENCHMARK // 2]
-        estimated_steps = MAX_STEPS
-        estimated_total_minutes = int(median_step_time * estimated_steps / 60)
-        print(f"Estimated training time: {estimated_total_minutes // 60}h{estimated_total_minutes % 60}m")
-        print(f"epoch global_ops: {GlobalCounters.global_ops:_}, "
-              f"epoch global_mem: {GlobalCounters.global_mem:_}")
-
-    if (sequences_seen // EVAL_FREQ != (sequences_seen - actual_gbs) // EVAL_FREQ and (i != 1 or EVAL_FREQ == 1)) or (BENCHMARK and i == BENCHMARK):
-      if EVAL_BS == 0: return
-      tqdm.write(f"evaluating after {sequences_seen} sequences")
-      profile_marker(f"eval @ {i}")
-
-      # run eval
-      eval_losses = []
-      eval_iter = get_eval_iter()
-      tqdm.write(f"evaluating {EVAL_SAMPLES//EVAL_BS} batches of {EVAL_BS} sequences")
-
-      for j,tokens in tqdm(enumerate(eval_iter), total=EVAL_SAMPLES//EVAL_BS):
-        eval_losses += eval_step(tokens).tolist()
-
-        if BENCHMARK and (j+1) == min(BENCHMARK, EVAL_SAMPLES//EVAL_BS):
-          return
-
-      log_perplexity = sum(eval_losses) / len(eval_losses)
-
-      tqdm.write(f"eval log perplexity: {log_perplexity:.4f}")
-
-      if WANDB:
-        wandb.log({"eval/log_perplexity": log_perplexity, "eval/sequences_seen": sequences_seen})
-
-      if log_perplexity < EVAL_TARGET:
-        tqdm.write(f"target achieved after {sequences_seen} sequences")
-        if getenv("CKPT"):
+        if (ckpt_freq := getenv("CKPT")) and (i % ckpt_freq == 0 and (i != 1 or ckpt_freq == 1)):
+          if deferred_lmhead is not None: deferred_lmhead.drain()
+          tqdm.write("saving checkpoint")
           if not os.path.exists(ckpt_dir := "./ckpts"): os.mkdir(ckpt_dir)
-          fn = f"{ckpt_dir}/gptoss.safe"
+          fn = f"{ckpt_dir}/gptoss_{i}.safe"
           safe_save(get_state_dict(model), fn)
-        break
+
+          tqdm.write("saving optim checkpoint")
+          fn = f"{ckpt_dir}/gptoss_{i}_optim.safe"
+          safe_save(get_state_dict(scheduler), fn)
+
+        if i == BENCHMARK:
+          median_step_time = sorted(step_times)[BENCHMARK // 2]
+          estimated_steps = MAX_STEPS
+          estimated_total_minutes = int(median_step_time * estimated_steps / 60)
+          print(f"Estimated training time: {estimated_total_minutes // 60}h{estimated_total_minutes % 60}m")
+          print(f"epoch global_ops: {GlobalCounters.global_ops:_}, "
+                f"epoch global_mem: {GlobalCounters.global_mem:_}")
+
+      if (sequences_seen // EVAL_FREQ != (sequences_seen - BS) // EVAL_FREQ and (i != 1 or EVAL_FREQ == 1)) or (BENCHMARK and i == BENCHMARK):
+        if deferred_lmhead is not None: deferred_lmhead.drain()
+        if EVAL_BS == 0: return
+        tqdm.write(f"evaluating after {sequences_seen} sequences")
+        profile_marker(f"eval @ {i}")
+
+        # run eval
+        eval_losses = []
+        eval_iter = get_eval_iter()
+        tqdm.write(f"evaluating {EVAL_SAMPLES//EVAL_BS} batches of {EVAL_BS} sequences")
+
+        for j,tokens in tqdm(enumerate(eval_iter), total=EVAL_SAMPLES//EVAL_BS):
+          eval_loss = eval_step(tokens)
+          for dev in device: Device[dev].synchronize()
+          eval_losses += eval_loss.tolist()
+
+          if BENCHMARK and (j+1) == min(BENCHMARK, EVAL_SAMPLES//EVAL_BS):
+            return
+
+        log_perplexity = sum(eval_losses) / len(eval_losses)
+
+        tqdm.write(f"eval log perplexity: {log_perplexity:.4f}")
+
+        if WANDB:
+          wandb.log({"eval/log_perplexity": log_perplexity, "eval/sequences_seen": sequences_seen})
+
+        if log_perplexity < EVAL_TARGET:
+          tqdm.write(f"target achieved after {sequences_seen} sequences")
+          if getenv("CKPT"):
+            if not os.path.exists(ckpt_dir := "./ckpts"): os.mkdir(ckpt_dir)
+            fn = f"{ckpt_dir}/gptoss.safe"
+            safe_save(get_state_dict(model), fn)
+          break
+
+  finally:
+    if __import__("sys").exc_info()[0] is None and deferred_lmhead is not None: deferred_lmhead.drain()
 
 def train_stable_diffusion():
   from extra.models.unet import UNetModel
